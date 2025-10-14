@@ -288,24 +288,43 @@ def parse_namemc_html(html: str) -> List[Dict[str, Optional[str]]]:
 
 
 def fetch_laby_api_data(uuid: str) -> List[Dict[str, Optional[str]]]:
-    url = f"https://laby.net/api/user/{uuid}/name-history"
-    log.info("Fetching Laby.net API", extra={"url": url})
+    url = f"https://laby.net/@{uuid}"
+    log.info("Fetching Laby.net profile page", extra={"url": url})
     try:
         r = scraper_session.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
+        log.info("Laby.net response", extra={"url": url, "status_code": r.status_code})
+        if r.status_code != 200:
+            log.error("Laby.net profile fetch failed", extra={"url": url, "status_code": r.status_code})
+            return []
+        html = r.text
+        # Parse the HTML for name history
+        soup = BeautifulSoup(html, "html.parser")
+        # Look for a section or table containing name history
+        # This is a best-effort guess based on the HTML structure
+        history_section = soup.find(string=lambda s: s and "Name history" in s)
+        if not history_section:
+            log.warning("Laby.net: No name history section found", extra={"url": url})
+            return []
+        # Try to find the parent element containing the table
+        card = history_section.find_parent(class_="card") if hasattr(history_section, 'find_parent') else None
+        if not card:
+            log.warning("Laby.net: No card container for name history", extra={"url": url})
+            return []
+        table = card.find("table")
+        if not table:
+            log.warning("Laby.net: No table for name history", extra={"url": url})
+            return []
         out = []
-        for item in data:
-            ts = item.get("changed_at")
-            iso_ts = (
-                datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-                if isinstance(ts, int)
-                else None
-            )
-            out.append({"name": item.get("name"), "changedAt": iso_ts})
+        for row in table.find("tbody").find_all("tr"):
+            name_tag = row.select_one("td a")
+            name = name_tag.get_text(strip=True) if name_tag else None
+            time_tag = row.find("time", datetime=True)
+            changed_at = time_tag["datetime"].strip() if time_tag and "datetime" in time_tag.attrs else None
+            if name:
+                out.append({"name": name, "changedAt": changed_at})
         return out
     except Exception as e:
-        log.error("Laby.net API fetch failed", extra={"url": url, "error": str(e)})
+        log.error("Laby.net HTML fetch/parse failed", extra={"url": url, "error": str(e)})
         return []
 
 
@@ -651,68 +670,47 @@ def merge_remote_sources(
             # (prefer the first entry from the most reliable source)
             for group in timestamp_groups:
                 # Use the first entry's timestamp and name
-                best_entry = group[0]
-                # Store with the timestamp as key to avoid duplicates
-                key = f"{name_lower}_{best_entry[1]}"
-                if key not in merged:
-                    merged[key] = best_entry
-
-        # If we have undated entries and no dated entries, add one undated
-        if undated and not dated:
-            # Use the first undated entry
-            key = f"{name_lower}_undated"
-            if key not in merged:
-                merged[key] = undated[0]
-
-    # Convert back to list and sort by timestamp
-    result = list(merged.values())
-
-    # Separate dated and undated
-    dated_entries = [(n, t) for n, t in result if t is not None]
-    undated_entries = [(n, t) for n, t in result if t is None]
-
-    # Sort dated by timestamp
-    dated_entries.sort(key=lambda x: x[1])
-
-    # Return undated first, then dated
-    return undated_entries + dated_entries
-
-
-def _update_profile_from_sources(uuid: str, current_name: str) -> Dict[str, Any]:
-    """The authoritative function to fetch, merge, and save a profile's history."""
-    if not uuid:
-        log.error(f"Invalid UUID provided for {current_name}")
-        return {"query": current_name, "uuid": None, "last_seen_at": None, "history": []}
-
-    log.info(
-        "Updating profile from sources",
-        extra={"uuid": uuid, "current_name": current_name},
-    )
-
-    rows = gather_remote_rows_by_uuid(uuid)
-
-    if not rows:
-        log.warning(
-            "No historical data found from any source for profile", extra={"uuid": uuid}
-        )
-
-    pairs = merge_remote_sources(rows)
-
-    with tx() as con:
-        # Update the main profile entry with the latest known current name
-        ensure_profile(con, uuid, current_name)
-
-        # Insert all historical names
-        for n, t in pairs:
-            if n is None:
-                continue
-            insert_or_merge_history(con, uuid, n, t, "profiles", t)
-
-        # Ensure the current name is correctly marked as the last entry
-        ensure_current_entry(con, uuid, current_name)
-
-        # Update source timestamps
-        update_source_timestamp(con, uuid, "mojang")
+                """
+                Intelligently merge entries from multiple sources.
+                Allow non-consecutive duplicate names, but not consecutive duplicates.
+                Prefer entries with timestamps, deduplicate by (name, changed_at).
+                """
+                # Collect all entries, preserving order: undated first, then by timestamp
+                all_entries = []
+                seen = set()
+                # First, collect undated entries (changedAt is None)
+                for row in rows:
+                    name = row.get("name")
+                    changed_at = row.get("changedAt")
+                    if not name:
+                        continue
+                    if changed_at is None:
+                        key = (name, changed_at)
+                        if key not in seen:
+                            all_entries.append((name, changed_at))
+                            seen.add(key)
+                # Then, collect dated entries, sorted by timestamp
+                dated = [
+                    (row.get("name"), row.get("changedAt"))
+                    for row in rows
+                    if row.get("name") and row.get("changedAt") is not None
+                ]
+                # Remove duplicates by (name, changed_at)
+                dated = list({(n, t): (n, t) for n, t in dated}.values())
+                # Sort by changed_at (ISO string)
+                dated.sort(key=lambda x: x[1])
+                for entry in dated:
+                    if entry not in all_entries:
+                        all_entries.append(entry)
+                # Now, remove consecutive duplicates (same name as previous)
+                result = []
+                last_name = None
+                for name, changed_at in all_entries:
+                    if name == last_name:
+                        continue
+                    result.append((name, changed_at))
+                    last_name = name
+                return result
         update_source_timestamp(con, uuid, "scraper")
 
         return query_history_public(con, uuid)
