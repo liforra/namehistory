@@ -6,16 +6,21 @@ import re
 import time
 import json
 import random
-from sqlalchemy import (
-    create_engine, Column, String, Integer, DateTime, ForeignKey, UniqueConstraint, Index, Text
-)
-from sqlalchemy.orm import sessionmaker, declarative_base, relationship, scoped_session
-from sqlalchemy.exc import SQLAlchemyError
 import threading
 import argparse
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+
+from sqlalchemy import (
+    create_engine, Column, String, Integer, DateTime, ForeignKey, 
+    UniqueConstraint, Index, Text, select, update, insert
+)
+from sqlalchemy.orm import (
+    sessionmaker, declarative_base, relationship, scoped_session, 
+    Session, joinedload
+)
+from sqlalchemy.exc import SQLAlchemyError
 
 from curl_cffi.requests import Session
 import requests
@@ -398,17 +403,6 @@ def init_db():
     Base.metadata.create_all(bind=engine)
 
 
-def connect_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=15, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    with connect_db() as con:
-        con.executescript(SCHEMA)
-
-
 
 @contextmanager
 def tx():
@@ -731,28 +725,33 @@ def auto_update_worker():
 
             log.info("Running auto-update check...")
 
-            with tx() as con:
+            with tx() as session:
                 # Find profiles that need scraper updates
-                scraper_cutoff = (
-                    datetime.now(timezone.utc) - timedelta(hours=SCRAPER_STALE_HOURS)
-                ).isoformat()
-                scraper_stale = con.execute(
-                    """
-                    SELECT p.uuid, p.query
-                    FROM profiles p
-                    LEFT JOIN source_updates su ON p.uuid = su.uuid AND su.source = 'scraper'
-                    WHERE su.last_updated_at IS NULL OR su.last_updated_at < ?
-                    ORDER BY su.last_updated_at ASC NULLS FIRST
-                    LIMIT ?
-                """,
-                    (scraper_cutoff, AUTO_UPDATE_BATCH_SIZE),
-                ).fetchall()
+                scraper_cutoff = datetime.now(timezone.utc) - timedelta(hours=SCRAPER_STALE_HOURS)
+                
+                # Build query to find stale profiles
+                profiles_query = (
+                    session.query(Profile)
+                    .outerjoin(
+                        SourceUpdate,
+                        (Profile.uuid == SourceUpdate.uuid) & 
+                        (SourceUpdate.source == 'scraper')
+                    )
+                    .filter(
+                        (SourceUpdate.last_updated_at.is_(None)) |
+                        (SourceUpdate.last_updated_at < scraper_cutoff)
+                    )
+                    .order_by(SourceUpdate.last_updated_at.asc().nullsfirst())
+                    .limit(AUTO_UPDATE_BATCH_SIZE)
+                )
+                
+                scraper_stale = profiles_query.all()
 
             # Update scraper data
             for profile in scraper_stale:
                 try:
-                    uuid = profile["uuid"]
-                    current_name = profile["query"]
+                    uuid = profile.uuid
+                    current_name = profile.query
                     log.info(
                         "Auto-updating profile",
                         extra={"uuid": uuid, "username": current_name},
@@ -762,7 +761,7 @@ def auto_update_worker():
                 except Exception as e:
                     log.error(
                         "Auto-update failed",
-                        extra={"uuid": profile["uuid"], "error": str(e)},
+                        extra={"uuid": uuid, "error": str(e)},
                     )
 
             log.info(f"Auto-update complete. Processed {len(scraper_stale)} profiles.")
@@ -1014,8 +1013,8 @@ def api_update():
 def api_refresh_all():
     """Trigger a refresh of all profiles over 24 hours"""
     try:
-        with tx() as con:
-            profiles = con.execute("SELECT uuid FROM profiles").fetchall()
+        with tx() as session:
+            profiles = session.query(Profile.uuid).all()
             total = len(profiles)
 
             if total == 0:
@@ -1025,20 +1024,29 @@ def api_refresh_all():
             delay_per_profile = seconds_in_day / total
 
             current_time = datetime.now(timezone.utc)
-            for idx, profile in enumerate(profiles):
+            for idx, (uuid,) in enumerate(profiles):
                 stale_time = (
                     current_time
                     - timedelta(hours=SCRAPER_STALE_HOURS + 1)
                     + timedelta(seconds=idx * delay_per_profile)
                 )
-                con.execute(
-                    "INSERT OR REPLACE INTO source_updates (uuid, source, last_updated_at) VALUES (?, 'mojang', ?)",
-                    (profile["uuid"], stale_time.isoformat()),
-                )
-                con.execute(
-                    "INSERT OR REPLACE INTO source_updates (uuid, source, last_updated_at) VALUES (?, 'scraper', ?)",
-                    (profile["uuid"], stale_time.isoformat()),
-                )
+                # Update or create Mojang source update
+                mojang_update = session.query(SourceUpdate).filter_by(
+                    uuid=uuid, source='mojang'
+                ).first()
+                if not mojang_update:
+                    mojang_update = SourceUpdate(uuid=uuid, source='mojang')
+                    session.add(mojang_update)
+                mojang_update.last_updated_at = stale_time
+
+                # Update or create Scraper source update
+                scraper_update = session.query(SourceUpdate).filter_by(
+                    uuid=uuid, source='scraper'
+                ).first()
+                if not scraper_update:
+                    scraper_update = SourceUpdate(uuid=uuid, source='scraper')
+                    session.add(scraper_update)
+                scraper_update.last_updated_at = stale_time
 
             log.info(f"Scheduled {total} profiles for refresh over 24 hours")
             return jsonify(
