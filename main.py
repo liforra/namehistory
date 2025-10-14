@@ -467,37 +467,40 @@ def is_source_stale(session, uuid: str, source: str, stale_hours: int) -> bool:
 
 
 def insert_or_merge_history(session, uuid: str, name: str, changed_at: Optional[str], provider: str, provider_changed_at: Optional[str]) -> None:
-    # Try to find an existing history entry (fuzzy or exact)
-    ta = parse_iso(changed_at)
-    if not is_censored(name) and changed_at is not None:
-        history_entry = session.query(History).filter_by(uuid=uuid, changed_at=changed_at).first()
-        if history_entry and is_censored(history_entry.name):
-            history_entry.name = name
-            # Check for existing ProviderDetail
-            existing_pd = session.query(ProviderDetail).filter_by(
-                history_id=history_entry.id, provider=provider, provider_changed_at=provider_changed_at
-            ).first()
-            if not existing_pd:
-                pd = ProviderDetail(history=history_entry, provider=provider, provider_changed_at=provider_changed_at)
-                session.add(pd)
-            logging.getLogger("merge").info("Uncensor upgrade", extra={"uuid": uuid, "ts": changed_at, "username": name})
-            return
 
+    # Check for exact duplicate (uuid, name, changed_at)
+    existing = session.query(History).filter_by(uuid=uuid, name=name, changed_at=changed_at).first()
+    if existing:
+        # Optionally update censored name to uncensored
+        if is_censored(existing.name) and not is_censored(name):
+            existing.name = name
+        # Check for existing ProviderDetail
+        existing_pd = session.query(ProviderDetail).filter_by(
+            history_id=existing.id, provider=provider, provider_changed_at=provider_changed_at
+        ).first()
+        if not existing_pd:
+            pd = ProviderDetail(history=existing, provider=provider, provider_changed_at=provider_changed_at)
+            session.add(pd)
+        logging.getLogger("merge").info("Duplicate found, updated if needed", extra={"uuid": uuid, "username": name, "changed_at": changed_at})
+        return
+
+    # Fuzzy merge: if changed_at is close to an existing entry for this uuid/name, update that entry
+    ta = parse_iso(changed_at)
     if ta:
-        history_entry = session.query(History).filter_by(uuid=uuid, name=name).first()
-        if history_entry:
-            tb = parse_iso(history_entry.changed_at)
+        fuzzy = session.query(History).filter_by(uuid=uuid, name=name).first()
+        if fuzzy:
+            tb = parse_iso(fuzzy.changed_at)
             if tb and abs(ta - tb) <= FUZZY_WINDOW:
-                if history_entry.changed_at is None:
-                    history_entry.changed_at = changed_at
+                if fuzzy.changed_at is None:
+                    fuzzy.changed_at = changed_at
                 # Check for existing ProviderDetail
                 existing_pd = session.query(ProviderDetail).filter_by(
-                    history_id=history_entry.id, provider=provider, provider_changed_at=provider_changed_at
+                    history_id=fuzzy.id, provider=provider, provider_changed_at=provider_changed_at
                 ).first()
                 if not existing_pd:
-                    pd = ProviderDetail(history=history_entry, provider=provider, provider_changed_at=provider_changed_at)
+                    pd = ProviderDetail(history=fuzzy, provider=provider, provider_changed_at=provider_changed_at)
                     session.add(pd)
-                logging.getLogger("merge").info("Fuzzy-merged", extra={"uuid": uuid, "username": name, "from": history_entry.changed_at, "to": changed_at})
+                logging.getLogger("merge").info("Fuzzy-merged", extra={"uuid": uuid, "username": name, "from": fuzzy.changed_at, "to": changed_at})
                 return
 
     # Insert new history if not found
