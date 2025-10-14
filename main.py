@@ -458,7 +458,11 @@ def is_source_stale(session, uuid: str, source: str, stale_hours: int) -> bool:
     su = session.query(SourceUpdate).filter_by(uuid=uuid, source=source).first()
     if not su or not su.last_updated_at:
         return True
-    age = datetime.now(timezone.utc) - su.last_updated_at
+    last_updated = su.last_updated_at
+    # Ensure last_updated is timezone-aware (UTC)
+    if last_updated.tzinfo is None:
+        last_updated = last_updated.replace(tzinfo=timezone.utc)
+    age = datetime.now(timezone.utc) - last_updated
     return age.total_seconds() > (stale_hours * 3600)
 
 
@@ -469,8 +473,13 @@ def insert_or_merge_history(session, uuid: str, name: str, changed_at: Optional[
         history_entry = session.query(History).filter_by(uuid=uuid, changed_at=changed_at).first()
         if history_entry and is_censored(history_entry.name):
             history_entry.name = name
-            pd = ProviderDetail(history=history_entry, provider=provider, provider_changed_at=provider_changed_at)
-            session.add(pd)
+            # Check for existing ProviderDetail
+            existing_pd = session.query(ProviderDetail).filter_by(
+                history_id=history_entry.id, provider=provider, provider_changed_at=provider_changed_at
+            ).first()
+            if not existing_pd:
+                pd = ProviderDetail(history=history_entry, provider=provider, provider_changed_at=provider_changed_at)
+                session.add(pd)
             logging.getLogger("merge").info("Uncensor upgrade", extra={"uuid": uuid, "ts": changed_at, "username": name})
             return
 
@@ -481,8 +490,13 @@ def insert_or_merge_history(session, uuid: str, name: str, changed_at: Optional[
             if tb and abs(ta - tb) <= FUZZY_WINDOW:
                 if history_entry.changed_at is None:
                     history_entry.changed_at = changed_at
-                pd = ProviderDetail(history=history_entry, provider=provider, provider_changed_at=provider_changed_at)
-                session.add(pd)
+                # Check for existing ProviderDetail
+                existing_pd = session.query(ProviderDetail).filter_by(
+                    history_id=history_entry.id, provider=provider, provider_changed_at=provider_changed_at
+                ).first()
+                if not existing_pd:
+                    pd = ProviderDetail(history=history_entry, provider=provider, provider_changed_at=provider_changed_at)
+                    session.add(pd)
                 logging.getLogger("merge").info("Fuzzy-merged", extra={"uuid": uuid, "username": name, "from": history_entry.changed_at, "to": changed_at})
                 return
 
@@ -491,9 +505,13 @@ def insert_or_merge_history(session, uuid: str, name: str, changed_at: Optional[
     history_entry = History(uuid=uuid, name=name, changed_at=changed_at, observed_at=observed_at)
     session.add(history_entry)
     session.flush()  # Ensure we have the ID
-    
-    pd = ProviderDetail(history=history_entry, provider=provider, provider_changed_at=provider_changed_at)
-    session.add(pd)
+    # Check for existing ProviderDetail (should not exist for new history, but for safety)
+    existing_pd = session.query(ProviderDetail).filter_by(
+        history_id=history_entry.id, provider=provider, provider_changed_at=provider_changed_at
+    ).first()
+    if not existing_pd:
+        pd = ProviderDetail(history=history_entry, provider=provider, provider_changed_at=provider_changed_at)
+        session.add(pd)
     logging.getLogger("merge").info("Inserted history", extra={"uuid": uuid, "username": name, "changed_at": changed_at})
 
 
