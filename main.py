@@ -36,6 +36,7 @@ except Exception:
 import logging
 from logging.handlers import RotatingFileHandler
 
+# --- CONFIGURATION ---
 CONFIG: Dict[str, Any] = {
     "server": {"host": "127.0.0.1", "port": 8000},
     "rate_limit": {"rpm": 5, "window_seconds": 60},
@@ -62,7 +63,6 @@ CONFIG: Dict[str, Any] = {
     },
 }
 
-
 def load_config():
     global CONFIG
     path = "config.toml"
@@ -74,7 +74,6 @@ def load_config():
                 CONFIG[k].update(v)
             else:
                 CONFIG[k] = v
-
 
 load_config()
 
@@ -96,7 +95,7 @@ MOJANG_STALE_HOURS = int(CONFIG["auto_update"]["mojang_stale_hours"])
 SCRAPER_STALE_HOURS = int(CONFIG["auto_update"]["scraper_stale_hours"])
 AUTO_UPDATE_BATCH_SIZE = int(CONFIG["auto_update"]["batch_size"])
 
-
+# --- LOGGING SETUP ---
 def setup_logging():
     lvl = str(CONFIG.get("logging", {}).get("level", "INFO")).upper()
     json_mode = bool(CONFIG.get("logging", {}).get("json", False))
@@ -112,9 +111,6 @@ def setup_logging():
                 "msg": record.getMessage(),
                 "logger": record.name,
             }
-            for key, value in record.__dict__.items():
-                if key not in logging.LogRecord.__dict__ and key not in payload:
-                    payload[key] = value
             if record.exc_info:
                 payload["exc"] = self.formatException(record.exc_info)
             return json.dumps(payload, ensure_ascii=False)
@@ -124,11 +120,7 @@ def setup_logging():
         for handler in root.handlers:
             root.removeHandler(handler)
     root.setLevel(getattr(logging, lvl, logging.INFO))
-    fmt = (
-        JsonFormatter()
-        if json_mode
-        else logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    )
+    fmt = JsonFormatter() if json_mode else logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     ch = logging.StreamHandler()
     ch.setFormatter(fmt)
     root.addHandler(ch)
@@ -137,268 +129,117 @@ def setup_logging():
         fh.setFormatter(fmt)
         root.addHandler(fh)
 
-
 setup_logging()
 log = logging.getLogger("namehistory")
 
-UA_POOL = (
-    [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.5; rv:131.0) Gecko/20100101 Firefox/131.0",
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
-        "Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) CriOS/124.0.0.0 Mobile/15E148 Safari/604.1",
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X; rv:131.0) Gecko/20100101 Firefox/131.0 Mobile/15E148",
-        "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
-        "Mozilla/5.0 (Linux; Android 14; SM-S921B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/23.0 Chrome/120.0.6099.231 Mobile Safari/537.36",
-        "Mozilla/5.0 (Android 14; Mobile; rv:131.0) Gecko/131.0 Firefox/131.0",
-    ]
-    + [
-        f"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{rv}.0) Gecko/20100101 Firefox/{rv}.0"
-        for rv in range(90, 120)
-    ]
-    + [
-        f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{v}.0.0.0 Safari/537.36"
-        for v in range(100, 120)
-    ]
-    + [
-        f"Mozilla/5.0 (Macintosh; Intel Mac OS X 14_{m}) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.{m} Safari/605.1.15"
-        for m in range(0, 10)
-    ]
-)
-UA_POOL = UA_POOL[:100]
-
+# --- HTTP & UTILS ---
+UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
+]
 scraper_session = Session(impersonate="chrome110")
 mojang_session = requests.Session()
-
 
 def jitter_sleep(base: float = DEFAULT_SLEEP):
     time.sleep(base + random.uniform(0.05, 0.2))
 
-
 def bulk_sleep():
     time.sleep(random.uniform(BULK_MIN_DELAY, BULK_MAX_DELAY))
-
 
 MCS_LOOKUP = "https://api.minecraftservices.com/minecraft/profile/lookup/name/{name}"
 MCS_PROFILE = "https://sessionserver.mojang.com/session/minecraft/profile/{uuid}"
 
-
 def dashed_uuid(raw: str) -> str:
     raw = raw.replace("-", "").strip()
-    m = re.fullmatch(r"[0-9a-fA-F]{32}", raw)
-    if not m:
-        return raw
-    s = raw.lower()
-    return f"{s[0:8]}-{s[8:12]}-{s[12:16]}-{s[16:20]}-{s[20:32]}"
+    if re.fullmatch(r"[0-9a-fA-F]{32}", raw):
+        s = raw.lower()
+        return f"{s[0:8]}-{s[8:12]}-{s[12:16]}-{s[16:20]}-{s[20:32]}"
+    return raw
 
+def parse_iso(dt: Optional[str]) -> Optional[datetime]:
+    if not dt: return None
+    try: return datetime.fromisoformat(dt.replace("Z", "+00:00"))
+    except: return None
 
+# --- DATA FETCHING ---
 def normalize_username(name: str) -> Optional[Tuple[str, Optional[str]]]:
-    """Get properly capitalized username and UUID from Mojang API"""
     try:
         r = mojang_session.get(MCS_LOOKUP.format(name=name), timeout=10.0)
-        if r.status_code == 404:
-            return None
+        if r.status_code == 404: return None
         r.raise_for_status()
         data = r.json()
-        proper_name = data.get("name")
-        uuid = data.get("id")
-        if not uuid:
-            return None
-        return (proper_name, dashed_uuid(uuid))
+        return (data.get("name"), dashed_uuid(data.get("id")))
     except Exception as e:
-        log.warning(
-            "Failed to normalize username", extra={"username": name, "error": str(e)}
-        )
+        log.warning("Failed to normalize username", extra={"username": name, "error": str(e)})
         return None
-
 
 def get_profile_by_uuid_from_mojang(uuid: str) -> Optional[str]:
-    """Gets the current username for a given UUID from Mojang."""
     try:
-        url = MCS_PROFILE.format(uuid=uuid.replace("-", ""))
-        r = mojang_session.get(url, timeout=10.0)
-        if r.status_code == 200:
-            data = r.json()
-            return data.get("name")
-        return None
+        r = mojang_session.get(MCS_PROFILE.format(uuid=uuid.replace("-", "")), timeout=10.0)
+        return r.json().get("name") if r.status_code == 200 else None
     except Exception as e:
-        log.error(
-            "Failed to get profile by UUID from Mojang",
-            extra={"uuid": uuid, "error": str(e)},
-        )
+        log.error("Failed to get profile by UUID from Mojang", extra={"uuid": uuid, "error": str(e)})
         return None
 
-
-def is_censored(name: Optional[str]) -> bool:
-    if name is None:
-        return False
-    n = name.strip()
-    return n in {"-", "—", "–", "‑"} or n == ""
-
-
-def fetch_profile_html(url: str, timeout: float = 15.0) -> str:
-    t0 = time.time()
-    headers = {"User-Agent": random.choice(UA_POOL)}
+def fetch_namemc_data(username: str) -> List[Dict[str, Optional[str]]]:
     try:
-        r = scraper_session.get(url, headers=headers, timeout=timeout)
-        if r.status_code >= 400:
-            log.error("Fetch error", extra={"url": url, "status": r.status_code})
-            return ""
-        log.info(
-            "Fetch ok",
-            extra={
-                "url": url,
-                "status": r.status_code,
-                "ms": int((time.time() - t0) * 1000),
-            },
-        )
-        return r.text
+        url = f"https://namemc.com/profile/{username}"
+        html = fetch_profile_html(url)
+        if not html: return []
+        soup = BeautifulSoup(html, "html.parser")
+        header = soup.find(string=re.compile(r"^\s*Name History\s*$"))
+        if not header: return []
+        card = header.find_parent(class_="card")
+        if not card or not card.find("table"): return []
+        
+        out = []
+        for row in card.find("tbody").find_all("tr"):
+            name_tag = row.select_one("td a")
+            time_tag = row.find("time", datetime=True)
+            if name_tag:
+                out.append({
+                    "name": name_tag.get_text(strip=True),
+                    "changedAt": time_tag["datetime"].strip() if time_tag else None
+                })
+        return out
     except Exception as e:
-        log.error("Fetch exception", extra={"url": url, "error": str(e)})
-        return ""
-
-
-def parse_namemc_html(html: str) -> List[Dict[str, Optional[str]]]:
-    soup = BeautifulSoup(html, "html.parser")
-    header = soup.find(string=re.compile(r"^\s*Name History\s*$"))
-    if not header:
+        log.error("NameMC fetch failed", extra={"username": username, "error": str(e)})
         return []
-    card = header.find_parent(class_="card")
-    if not card:
-        return []
-    table = card.find("table")
-    if not table:
-        return []
-    out = []
-    for row in table.find("tbody").find_all("tr"):
-        if "d-lg-none" in row.get("class", []):
-            continue
-        name_tag = row.select_one("td a")
-        name = name_tag.get_text(strip=True) if name_tag else None
-        time_tag = row.find("time", datetime=True)
-        changed_at = time_tag["datetime"].strip() if time_tag else None
-        if name:
-            out.append({"name": name, "changedAt": changed_at})
-    return out
-
 
 def fetch_laby_api_data(uuid: str) -> List[Dict[str, Optional[str]]]:
-    """Fetch name history from Laby.net API"""
     url = f"https://laby.net/api/user/{uuid}/get-names"
-    log.info("Fetching Laby.net API", extra={"url": url})
     try:
-        headers = {"Accept": "application/json", "User-Agent": random.choice(UA_POOL)}
-        r = scraper_session.get(url, headers=headers, timeout=10)
-        log.info("Laby.net response", extra={"url": url, "status_code": r.status_code})
-        
+        r = scraper_session.get(url, headers={"Accept": "application/json"}, timeout=10)
         if r.status_code != 200:
-            log.error("Laby.net API fetch failed", extra={"url": url, "status_code": r.status_code})
+            log.error("Laby.net API fetch failed", extra={"url": url, "status": r.status_code})
             return []
-        
         data = r.json()
-        
-        # data is an array of name history objects
-        out = []
-        for entry in data:
-            name = entry.get("name") or entry.get("username")
-            changed_at = entry.get("changed_at")
-            if name:
-                out.append({"name": name, "changedAt": changed_at})
-        
-        log.info("Laby.net API success", extra={"url": url, "entries": len(out)})
-        return out
+        return [{"name": e.get("name"), "changedAt": e.get("changed_at")} for e in data if e.get("name")]
     except Exception as e:
         log.error("Laby.net API fetch/parse failed", extra={"url": url, "error": str(e)})
         return []
 
-
 def gather_remote_rows_by_uuid(uuid: str) -> List[Dict[str, Optional[str]]]:
-    rows: List[Dict[str, Optional[str]]] = []
+    rows = []
     current_name = get_profile_by_uuid_from_mojang(uuid)
-
-    # Scrape NameMC using the current name
     if current_name:
-        try:
-            html_a = fetch_profile_html(f"https://namemc.com/profile/{current_name}")
-            if html_a:
-                rows.extend(parse_namemc_html(html_a))
-        except Exception:
-            log.warning("Source A (namemc) failed", exc_info=False)
+        rows.extend(fetch_namemc_data(current_name))
         jitter_sleep()
-
-    # Fetch from Laby.net API using UUID
-    try:
-        rows.extend(fetch_laby_api_data(uuid))
-    except Exception:
-        log.warning("Source B (laby) failed", exc_info=False)
-
+    rows.extend(fetch_laby_api_data(uuid))
     return rows
 
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def parse_iso(dt: Optional[str]) -> Optional[datetime]:
-    if not dt:
-        return None
-    try:
-        return datetime.fromisoformat(dt.replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-
-def merge_remote_sources(
-    rows: List[Dict[str, Optional[str]]],
-) -> List[Tuple[str, Optional[str]]]:
-    """
-    Intelligently merge entries from multiple sources.
-    Preserve chronological order, with original name (null timestamp) first.
-    """
-    # Separate entries with and without timestamps
-    original_entries = []  # null changed_at (original name)
-    dated_entries = []  # has changed_at timestamp
-    
-    seen = set()
-    
+def merge_remote_sources(rows: List[Dict[str, Optional[str]]]) -> List[Tuple[str, Optional[str]]]:
+    unique_entries = {}
     for row in rows:
         name = row.get("name")
         changed_at = row.get("changedAt")
-        if not name:
-            continue
-        
-        key = (name.lower(), changed_at)
-        if key in seen:
-            continue
-        seen.add(key)
-        
-        if changed_at is None:
-            original_entries.append((name, changed_at))
-        else:
-            dated_entries.append((name, changed_at))
-    
-    # Sort dated entries chronologically
-    dated_entries.sort(key=lambda x: x[1] or "")
-    
-    # Build result: original first (if exists), then all dated entries in order
-    result = []
-    
-    # Add original name first (the one with null timestamp)
-    if original_entries:
-        result.append(original_entries[0])
-    
-    # Add all dated entries in chronological order
-    result.extend(dated_entries)
-    
-    return result
+        if name:
+            key = (name.lower(), changed_at)
+            if key not in unique_entries:
+                unique_entries[key] = (name, changed_at)
+    return list(unique_entries.values())
 
-
-# --- SQLAlchemy Setup ---
+# --- DATABASE SETUP & MODELS ---
 Base = declarative_base()
 
 class Profile(Base):
@@ -417,21 +258,7 @@ class History(Base):
     changed_at = Column(String(32), index=True)
     observed_at = Column(DateTime, nullable=False)
     profile = relationship("Profile", back_populates="history")
-    provider_details = relationship("ProviderDetail", back_populates="history", cascade="all, delete-orphan")
-    __table_args__ = (
-        UniqueConstraint("uuid", "name", "changed_at"),
-    )
-
-class ProviderDetail(Base):
-    __tablename__ = "provider_details"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    history_id = Column(Integer, ForeignKey("history.id", ondelete="CASCADE"), nullable=False)
-    provider = Column(String(32), nullable=False)
-    provider_changed_at = Column(String(32))
-    history = relationship("History", back_populates="provider_details")
-    __table_args__ = (
-        UniqueConstraint("history_id", "provider", "provider_changed_at"),
-    )
+    __table_args__ = (UniqueConstraint("uuid", "name", "changed_at"),)
 
 class SourceUpdate(Base):
     __tablename__ = "source_updates"
@@ -440,22 +267,15 @@ class SourceUpdate(Base):
     last_updated_at = Column(DateTime, nullable=False, index=True)
     profile = relationship("Profile", back_populates="source_updates")
 
-# --- Engine selection ---
 if DB_TYPE == "sqlite":
     db_url = f"sqlite:///{DB_PATH}"
-elif DB_TYPE in ("mysql", "mariadb"):
-    db_url = DB_URL or f"mysql+pymysql://user:password@localhost/namehistory"
-elif DB_TYPE == "postgresql":
-    db_url = DB_URL or f"postgresql+psycopg2://user:password@localhost/namehistory"
 else:
-    raise RuntimeError(f"Unsupported DB type: {DB_TYPE}")
-
+    db_url = DB_URL
 engine = create_engine(db_url, echo=False, future=True)
 SessionLocal = scoped_session(sessionmaker(bind=engine, autoflush=False, autocommit=False))
 
 def init_db():
     Base.metadata.create_all(bind=engine)
-
 
 @contextmanager
 def tx():
@@ -464,733 +284,190 @@ def tx():
         yield session
         session.commit()
     except Exception:
-        session.rollback()
-        raise
+        session.rollback(); raise
     finally:
         session.close()
 
-
-def ensure_profile(session, uuid: str, query: Optional[str]) -> None:
+# --- CORE LOGIC ---
+def ensure_profile(session, uuid: str, query: Optional[str]):
     profile = session.get(Profile, uuid)
     now = datetime.now(timezone.utc)
-    if not profile:
-        profile = Profile(uuid=uuid, query=query, last_seen_at=now)
-        session.add(profile)
-    else:
-        profile.query = query
-        profile.last_seen_at = now
-
-
-def get_profile_by_uuid(session, uuid: str):
-    return session.get(Profile, uuid)
-
+    if not profile: session.add(Profile(uuid=uuid, query=query, last_seen_at=now))
+    else: profile.query = query; profile.last_seen_at = now
 
 def get_uuid_from_history_by_name(session, username: str) -> Optional[str]:
-    row = (
-        session.query(History.uuid)
-        .filter(History.name.ilike(username))
-        .order_by(History.observed_at.desc())
-        .first()
-    )
+    row = session.query(History.uuid).filter(History.name.ilike(username)).order_by(History.observed_at.desc()).first()
     return row[0] if row else None
 
-
-def update_source_timestamp(session, uuid: str, source: str) -> None:
+def update_source_timestamp(session, uuid: str, source: str):
     now = datetime.now(timezone.utc)
     su = session.query(SourceUpdate).filter_by(uuid=uuid, source=source).first()
-    if not su:
-        su = SourceUpdate(uuid=uuid, source=source, last_updated_at=now)
-        session.add(su)
-    else:
-        su.last_updated_at = now
-
+    if not su: session.add(SourceUpdate(uuid=uuid, source=source, last_updated_at=now))
+    else: su.last_updated_at = now
 
 def is_source_stale(session, uuid: str, source: str, stale_hours: int) -> bool:
     su = session.query(SourceUpdate).filter_by(uuid=uuid, source=source).first()
-    if not su or not su.last_updated_at:
-        return True
-    last_updated = su.last_updated_at
-    # Ensure last_updated is timezone-aware (UTC)
-    if last_updated.tzinfo is None:
-        last_updated = last_updated.replace(tzinfo=timezone.utc)
-    age = datetime.now(timezone.utc) - last_updated
-    return age.total_seconds() > (stale_hours * 3600)
+    if not su or not su.last_updated_at: return True
+    last_updated = su.last_updated_at.replace(tzinfo=timezone.utc) if su.last_updated_at.tzinfo is None else su.last_updated_at
+    return (datetime.now(timezone.utc) - last_updated).total_seconds() > (stale_hours * 3600)
 
-
-def insert_or_merge_history(session, uuid: str, name: str, changed_at: Optional[str], provider: str, provider_changed_at: Optional[str]) -> None:
-
-    # Check for exact duplicate (uuid, name, changed_at)
-    existing = session.query(History).filter_by(uuid=uuid, name=name, changed_at=changed_at).first()
-    if existing:
-        # Optionally update censored name to uncensored
-        if is_censored(existing.name) and not is_censored(name):
-            existing.name = name
-        # Check for existing ProviderDetail
-        existing_pd = session.query(ProviderDetail).filter_by(
-            history_id=existing.id, provider=provider, provider_changed_at=provider_changed_at
-        ).first()
-        if not existing_pd:
-            pd = ProviderDetail(history=existing, provider=provider, provider_changed_at=provider_changed_at)
-            session.add(pd)
-        logging.getLogger("merge").info("Duplicate found, updated if needed", extra={"uuid": uuid, "username": name, "changed_at": changed_at})
-        return
-
-    # Fuzzy merge: if changed_at is close to an existing entry for this uuid/name, update that entry
-    ta = parse_iso(changed_at)
-    if ta:
-        fuzzy = session.query(History).filter_by(uuid=uuid, name=name).first()
-        if fuzzy:
-            tb = parse_iso(fuzzy.changed_at)
-            if tb and abs(ta - tb) <= FUZZY_WINDOW:
-                if fuzzy.changed_at is None:
-                    fuzzy.changed_at = changed_at
-                # Check for existing ProviderDetail
-                existing_pd = session.query(ProviderDetail).filter_by(
-                    history_id=fuzzy.id, provider=provider, provider_changed_at=provider_changed_at
-                ).first()
-                if not existing_pd:
-                    pd = ProviderDetail(history=fuzzy, provider=provider, provider_changed_at=provider_changed_at)
-                    session.add(pd)
-                logging.getLogger("merge").info("Fuzzy-merged", extra={"uuid": uuid, "username": name, "from": fuzzy.changed_at, "to": changed_at})
-                return
-
-    # Insert new history if not found
-    observed_at = datetime.now(timezone.utc)
-    history_entry = History(uuid=uuid, name=name, changed_at=changed_at, observed_at=observed_at)
-    session.add(history_entry)
-    session.flush()  # Ensure we have the ID
-    # Check for existing ProviderDetail (should not exist for new history, but for safety)
-    existing_pd = session.query(ProviderDetail).filter_by(
-        history_id=history_entry.id, provider=provider, provider_changed_at=provider_changed_at
-    ).first()
-    if not existing_pd:
-        pd = ProviderDetail(history=history_entry, provider=provider, provider_changed_at=provider_changed_at)
-        session.add(pd)
-    logging.getLogger("merge").info("Inserted history", extra={"uuid": uuid, "username": name, "changed_at": changed_at})
-
-
-def ensure_current_entry(session, uuid: str, current_name: str) -> None:
-    """Ensure current name exists in history, but don't duplicate it"""
-    # Check if this name already exists in the history (with or without timestamp)
-    existing_any = session.query(History).filter_by(uuid=uuid, name=current_name).first()
-    if existing_any:
-        # Name already exists in history, don't add a duplicate
-        return
-    
-    # Only add if the name doesn't exist at all
-    log.info("Adding current name to history", extra={"uuid": uuid, "username": current_name})
-    insert_or_merge_history(session, uuid, current_name, None, "current", None)
-
+def insert_or_merge_history(session, uuid: str, name: str, changed_at: Optional[str]):
+    if not session.query(History).filter_by(uuid=uuid, name=name, changed_at=changed_at).first():
+        session.add(History(uuid=uuid, name=name, changed_at=changed_at, observed_at=datetime.now(timezone.utc)))
 
 def query_history_public(session, uuid: str) -> Dict[str, Any]:
-    p = get_profile_by_uuid(session, uuid)
-    if not p:
+    profile = session.get(Profile, uuid)
+    if not profile:
         return {"query": None, "uuid": uuid, "last_seen_at": None, "history": []}
 
     rows = session.query(History).filter_by(uuid=uuid).all()
     
-    # Separate entries into original (null changed_at) and dated
-    original = None
-    dated = []
+    # Sort entries by timestamp. Treat null as the oldest.
+    def sort_key(row):
+        return row.changed_at or "0000-01-01T00:00:00Z"
+    rows.sort(key=sort_key)
     
-    for r in rows:
-        observed_at = r.observed_at
-        if observed_at and observed_at.tzinfo is None:
-            observed_at = observed_at.replace(tzinfo=timezone.utc)
-        
-        entry = {
+    # Deduplicate consecutive names from the chronologically sorted list
+    final_rows = []
+    last_name = None
+    for row in rows:
+        if row.name != last_name:
+            final_rows.append(row)
+            last_name = row.name
+
+    history_items = []
+    for i, r in enumerate(final_rows):
+        history_items.append({
+            "id": i + 1,
             "name": r.name,
             "changed_at": r.changed_at,
-            "observed_at": observed_at.isoformat() if observed_at else None,
-        }
-        
-        if r.changed_at is None:
-            # This is the original name
-            if original is None or (observed_at and parse_iso(original["observed_at"]) and 
-                                   observed_at < parse_iso(original["observed_at"])):
-                original = entry
-        else:
-            dated.append(entry)
-    
-    # Sort dated entries chronologically
-    dated.sort(key=lambda x: x["changed_at"] or "")
-    
-    # Build final list: original first, then dated entries
-    final_list = []
-    if original:
-        final_list.append(original)
-    final_list.extend(dated)
-    
-    # Deduplicate and add metadata
-    items = []
-    seen_names = set()
-    for idx, entry in enumerate(final_list):
-        # Skip consecutive duplicates
-        if entry["name"] in seen_names:
-            continue
-        seen_names.add(entry["name"])
-        
-        items.append({
-            "id": idx + 1,
-            "name": entry["name"],
-            "changed_at": entry["changed_at"],
-            "observed_at": entry["observed_at"],
-            "censored": is_censored(entry["name"]),
+            "observed_at": r.observed_at.isoformat(),
+            "censored": r.name in {"-", "—", "–", "‑"} or r.name == "",
         })
-    
+        
     return {
-        "query": p.query,
-        "uuid": p.uuid,
-        "last_seen_at": p.last_seen_at,
-        "history": items,
+        "query": profile.query,
+        "uuid": profile.uuid,
+        "last_seen_at": profile.last_seen_at.isoformat(),
+        "history": history_items,
     }
 
-
 def _update_profile_from_sources(uuid: str, current_name: str) -> Dict[str, Any]:
-    """
-    Fetch, merge, and save a profile's history from all sources.
-    """
-    if not uuid:
-        log.error(f"Invalid UUID provided for {current_name}")
-        return {"query": current_name, "uuid": None, "last_seen_at": None, "history": []}
-
-    log.info(
-        "Updating profile from sources",
-        extra={"uuid": uuid, "current_name": current_name},
-    )
-
+    log.info("Updating profile from sources", extra={"uuid": uuid, "current_name": current_name})
     rows = gather_remote_rows_by_uuid(uuid)
-
-    if not rows:
-        log.warning(
-            "No historical data found from any source for profile", extra={"uuid": uuid}
-        )
-
     pairs = merge_remote_sources(rows)
 
     with tx() as con:
-        # Update the main profile entry with the latest known current name
         ensure_profile(con, uuid, current_name)
+        for name, changed_at in pairs:
+            insert_or_merge_history(con, uuid, name, changed_at)
+        
+        # Ensure the current name is in the DB if it's not already there from sources
+        if not any(p[0].lower() == current_name.lower() for p in pairs):
+            insert_or_merge_history(con, uuid, current_name, None)
 
-        # Insert all historical names
-        for n, t in pairs:
-            if n is None:
-                continue
-            insert_or_merge_history(con, uuid, n, t, "profiles", t)
-
-        # Ensure the current name exists (but don't duplicate)
-        ensure_current_entry(con, uuid, current_name)
-
-        # Update source timestamps
-        update_source_timestamp(con, uuid, "mojang")
         update_source_timestamp(con, uuid, "scraper")
-
         return query_history_public(con, uuid)
 
-
 def delete_profile(session, uuid: str) -> bool:
-    """Delete a profile and all associated data"""
     profile = session.get(Profile, uuid)
-    if not profile:
-        return False
-    session.delete(profile)
-    return True
-
-
-def clean_database():
-    log.info("=" * 60)
-    log.info("Starting database cleanup...")
-    log.info("=" * 60)
-    with tx() as session:
-        profiles = session.query(Profile).all()
-        total_deleted = 0
-        for profile in profiles:
-            uuid = profile.uuid
-            current_name = profile.query
-            duplicate_currents = (
-                session.query(History)
-                .filter_by(uuid=uuid, name=current_name, changed_at=None)
-                .order_by(History.observed_at.desc())
-                .all()
-            )
-            if len(duplicate_currents) > 1:
-                ids_to_delete = [row.id for row in duplicate_currents[1:]]
-                for row_id in ids_to_delete:
-                    session.query(History).filter_by(id=row_id).delete()
-                total_deleted += len(ids_to_delete)
-                log.info(f"Removed {len(ids_to_delete)} duplicate 'Current' entries for {current_name}", extra={"uuid": uuid})
-        log.info("=" * 60)
-        log.info(f"Database cleanup complete! Deleted {total_deleted} duplicate entries.")
-        log.info("=" * 60)
-
-
-# Auto-update background thread
-def auto_update_worker():
-    """Background worker that updates stale profiles"""
-    log.info("Auto-update worker started")
-
-    while True:
-        try:
-            time.sleep(AUTO_UPDATE_CHECK_INTERVAL)
-
-            if not AUTO_UPDATE_ENABLED:
-                continue
-
-            log.info("Running auto-update check...")
-
-            with tx() as session:
-                # Find profiles that need scraper updates
-                scraper_cutoff = datetime.now(timezone.utc) - timedelta(hours=SCRAPER_STALE_HOURS)
-                
-                # Build query to find stale profiles
-                profiles_query = (
-                    session.query(Profile)
-                    .outerjoin(
-                        SourceUpdate,
-                        (Profile.uuid == SourceUpdate.uuid) & 
-                        (SourceUpdate.source == 'scraper')
-                    )
-                    .filter(
-                        (SourceUpdate.last_updated_at.is_(None)) |
-                        (SourceUpdate.last_updated_at < scraper_cutoff)
-                    )
-                    .order_by(SourceUpdate.last_updated_at.asc().nullsfirst())
-                    .limit(AUTO_UPDATE_BATCH_SIZE)
-                )
-                
-                scraper_stale = profiles_query.all()
-
-            # Update scraper data
-            for profile in scraper_stale:
-                try:
-                    uuid = profile.uuid
-                    current_name = profile.query
-                    log.info(
-                        "Auto-updating profile",
-                        extra={"uuid": uuid, "username": current_name},
-                    )
-                    _update_profile_from_sources(uuid, current_name)
-                    bulk_sleep()
-                except Exception as e:
-                    log.error(
-                        "Auto-update failed",
-                        extra={"uuid": uuid, "error": str(e)},
-                    )
-
-            log.info(f"Auto-update complete. Processed {len(scraper_stale)} profiles.")
-
-        except Exception as e:
-            log.error("Auto-update worker error", exc_info=True)
-
-
-RATE_BUCKET: Dict[str, List[float]] = {}
-RATE_LOCK = threading.Lock()
-
-
-def rate_limit_ok(ip: str) -> bool:
-    now = time.time()
-    with RATE_LOCK:
-        bucket = RATE_BUCKET.setdefault(ip, [])
-        while bucket and now - bucket[0] > RATE_LIMIT_WINDOW:
-            bucket.pop(0)
-        if len(bucket) >= RATE_LIMIT_RPM:
-            return False
-        bucket.append(now)
+    if profile:
+        session.delete(profile)
         return True
+    return False
 
-
+# --- FLASK API ---
 app = Flask(__name__)
-
 
 @app.errorhandler(HTTPException)
 def handle_exception(e: HTTPException):
     response = e.get_response()
-    response.data = json.dumps(
-        {"code": e.code, "name": e.name, "description": e.description}
-    )
+    response.data = json.dumps({"code": e.code, "name": e.name, "description": e.description})
     response.content_type = "application/json"
     return response
 
-
+RATE_BUCKET: Dict[str, List[float]] = {}
+RATE_LOCK = threading.Lock()
 @app.before_request
 def _apply_rate_limit():
-    ip = (
-        request.headers.get("X-Forwarded-For", request.remote_addr or "unknown")
-        .split(",")[0]
-        .strip()
-    )
-    if not rate_limit_ok(ip):
-        logging.getLogger("api").warning(
-            "Rate limit", extra={"ip": ip, "path": request.path}
-        )
-        abort(429)
-    logging.getLogger("api").info(
-        "Request", extra={"ip": ip, "method": request.method, "path": request.path}
-    )
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    now = time.time()
+    with RATE_LOCK:
+        bucket = RATE_BUCKET.setdefault(ip, [])
+        bucket[:] = [t for t in bucket if now - t <= RATE_LIMIT_WINDOW]
+        if len(bucket) >= RATE_LIMIT_RPM:
+            log.warning("Rate limit exceeded", extra={"ip": ip, "path": request.path})
+            abort(429)
+        bucket.append(now)
 
-
-@app.get("/api/namehistory")
+@app.route("/api/namehistory", methods=["GET"])
 def api_namehistory_by_username():
     username = request.args.get("username", "").strip()
-    if not username or not re.fullmatch(r"[A-Za-z0-9_]{1,16}", username):
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,16}", username):
         abort(400, "username query parameter required (1–16 chars)")
 
-    # Check Mojang API first
     normalized = normalize_username(username)
+    uuid_to_query = None
+    current_name = None
 
     if normalized:
-        # Name exists on Mojang
-        current_name, uuid = normalized
-        if not uuid:
-            abort(404, "Could not get UUID from Mojang API")
-
-        log.info(
-            "Mojang check: name exists", extra={"username": current_name, "uuid": uuid}
-        )
-
-        with tx() as con:
-            if not is_source_stale(con, uuid, "scraper", SCRAPER_STALE_HOURS):
-                log.info("Cache is fresh, returning cached data", extra={"uuid": uuid})
-                return jsonify(query_history_public(con, uuid))
-
-        # Cache is stale, fetch fresh data
-        log.info("Cache is stale, fetching fresh data", extra={"uuid": uuid})
-        data = _update_profile_from_sources(uuid, current_name)
-        return jsonify(data)
+        current_name, uuid_to_query = normalized
     else:
-        # Name does not exist on Mojang, check if we have it cached as an old name
-        log.info("Mojang check: name does not exist", extra={"username": username})
-
         with tx() as con:
-            uuid_from_history = get_uuid_from_history_by_name(con, username)
+            uuid_to_query = get_uuid_from_history_by_name(con, username)
+            if uuid_to_query:
+                current_name = get_profile_by_uuid_from_mojang(uuid_to_query)
 
-        if uuid_from_history:
-            log.info(
-                "Found old profile in history cache",
-                extra={"username": username, "uuid": uuid_from_history},
-            )
-            # We found an old record. Let's find the user's new name.
-            new_current_name = get_profile_by_uuid_from_mojang(uuid_from_history)
+    if not uuid_to_query or not current_name:
+        abort(404, "Username not found")
 
-            if new_current_name:
-                log.info(
-                    "Migrating profile to new name",
-                    extra={"old_name": username, "new_name": new_current_name},
-                )
-                # Fetch fresh data for the new profile
-                fresh_data = _update_profile_from_sources(
-                    uuid_from_history, new_current_name
-                )
-                return jsonify(fresh_data)
-            else:
-                # The UUID is no longer valid, we cannot find the user.
-                log.warning(
-                    "UUID for old name no longer valid",
-                    extra={"uuid": uuid_from_history},
-                )
-                abort(404, "User associated with this old name could not be found.")
-        else:
-            # No current Mojang profile and no cached profile
-            abort(404, "Username not found")
+    with tx() as con:
+        if not is_source_stale(con, uuid_to_query, "scraper", SCRAPER_STALE_HOURS):
+            return jsonify(query_history_public(con, uuid_to_query))
+    
+    return jsonify(_update_profile_from_sources(uuid_to_query, current_name))
 
-
-@app.get("/api/namehistory/uuid/<uuid>")
+@app.route("/api/namehistory/uuid/<uuid>", methods=["GET"])
 def api_namehistory_by_uuid(uuid):
     uuid = dashed_uuid(uuid)
     current_name = get_profile_by_uuid_from_mojang(uuid)
     if not current_name:
         abort(404, "UUID not found")
-
     with tx() as con:
         if not is_source_stale(con, uuid, "scraper", SCRAPER_STALE_HOURS):
-            log.info(
-                "Cache is fresh for UUID, returning cached data", extra={"uuid": uuid}
-            )
             return jsonify(query_history_public(con, uuid))
+    return jsonify(_update_profile_from_sources(uuid, current_name))
 
-    log.info("Cache is stale for UUID, fetching fresh data", extra={"uuid": uuid})
-    data = _update_profile_from_sources(uuid, current_name)
-    return jsonify(data)
-
-
-@app.post("/api/namehistory/update")
-def api_update():
-    try:
-        body = request.get_json(force=True, silent=False) or {}
-        if not isinstance(body, dict):
-            abort(400, "JSON object expected")
-
-        # Bulk update
-        if "usernames" in body or "uuids" in body:
-            usernames = body.get("usernames") or []
-            uuids = body.get("uuids") or []
-            if not isinstance(usernames, list) or not isinstance(uuids, list):
-                abort(400, "'usernames' and 'uuids' must be arrays")
-
-            usernames = [
-                u.strip()
-                for u in usernames
-                if isinstance(u, str) and re.fullmatch(r"[A-Za-z0-9_]{1,16}", u.strip())
-            ]
-            uuids = [
-                dashed_uuid(u)
-                for u in uuids
-                if isinstance(u, str)
-                and re.fullmatch(r"[0-9a-fA-F-]{32,36}", u.strip())
-            ]
-
-            results = {"updated": [], "errors": []}
-
-            for idx, name in enumerate(usernames, 1):
-                log.info(
-                    "Bulk username",
-                    extra={"index": idx, "total": len(usernames), "username": name},
-                )
-                normalized = normalize_username(name)
-                if not normalized:
-                    results["errors"].append(
-                        {"username": name, "error": "Username not found"}
-                    )
-                    log.warning("Bulk username not found", extra={"username": name})
-                    continue
-
-                try:
-                    current_name, uuid = normalized
-                    results["updated"].append(
-                        _update_profile_from_sources(uuid, current_name)
-                    )
-                except Exception as e:
-                    error_desc = (
-                        e.description if isinstance(e, HTTPException) else str(e)
-                    )
-                    results["errors"].append({"username": name, "error": error_desc})
-                    log.error(
-                        "Bulk username failed",
-                        extra={"username": name, "error": error_desc},
-                    )
-                bulk_sleep()
-
-            for idx, u in enumerate(uuids, 1):
-                log.info(
-                    "Bulk uuid", extra={"index": idx, "total": len(uuids), "uuid": u}
-                )
-                current_name = get_profile_by_uuid_from_mojang(u)
-                if not current_name:
-                    results["errors"].append({"uuid": u, "error": "UUID not found"})
-                    log.warning("Bulk UUID not found", extra={"uuid": u})
-                    continue
-
-                try:
-                    results["updated"].append(
-                        _update_profile_from_sources(u, current_name)
-                    )
-                except Exception as e:
-                    error_desc = (
-                        e.description if isinstance(e, HTTPException) else str(e)
-                    )
-                    results["errors"].append({"uuid": u, "error": error_desc})
-                    log.error(
-                        "Bulk uuid failed", extra={"uuid": u, "error": error_desc}
-                    )
-                bulk_sleep()
-            return jsonify(results)
-
-        # Single update
-        elif "username" in body or "uuid" in body:
-            username = body.get("username")
-            uuid = body.get("uuid")
-            if username:
-                normalized = normalize_username(username)
-                if not normalized:
-                    abort(404, "Username not found")
-                current_name, uuid = normalized
-                data = _update_profile_from_sources(uuid, current_name)
-                return jsonify(data)
-            if uuid:
-                current_name = get_profile_by_uuid_from_mojang(uuid)
-                if not current_name:
-                    abort(404, "UUID not found")
-                data = _update_profile_from_sources(uuid, current_name)
-                return jsonify(data)
-
-        abort(
-            400,
-            "Provide 'username'/'uuid' for single update or 'usernames'/'uuids' for bulk update",
-        )
-
-    except Exception as e:
-        if isinstance(e, HTTPException):
-            raise e
-        log.error("API error in update", exc_info=True)
-        abort(500)
-
-
-@app.delete("/api/namehistory")
+@app.route("/api/namehistory", methods=["DELETE"])
 def api_delete():
-    """Delete a profile by username or UUID"""
     username = request.args.get("username", "").strip()
     uuid_param = request.args.get("uuid", "").strip()
-    
     if not username and not uuid_param:
         abort(400, "Either 'username' or 'uuid' parameter required")
     
     uuid = None
-    
     if uuid_param:
         uuid = dashed_uuid(uuid_param)
     elif username:
-        # Look up UUID from username
         normalized = normalize_username(username)
-        if normalized:
-            _, uuid = normalized
+        if normalized: _, uuid = normalized
         else:
-            # Try to find in history
-            with tx() as session:
-                uuid = get_uuid_from_history_by_name(session, username)
+            with tx() as s: uuid = get_uuid_from_history_by_name(s, username)
     
-    if not uuid:
-        abort(404, "Profile not found")
-    
-    with tx() as session:
-        deleted = delete_profile(session, uuid)
-        if not deleted:
-            abort(404, "Profile not found in database")
+    if not uuid: abort(404, "Profile not found")
+
+    with tx() as s:
+        if not delete_profile(s, uuid): abort(404, "Profile not found in database")
     
     log.info("Profile deleted", extra={"uuid": uuid})
     return jsonify({"message": "Profile deleted successfully", "uuid": uuid})
-
-
-@app.post("/api/namehistory/refresh-all")
-def api_refresh_all():
-    """Trigger a refresh of all profiles over 24 hours"""
-    try:
-        with tx() as session:
-            profiles = session.query(Profile.uuid).all()
-            total = len(profiles)
-
-            if total == 0:
-                return jsonify({"message": "No profiles to update", "total": 0})
-
-            seconds_in_day = 86400
-            delay_per_profile = seconds_in_day / total
-
-            current_time = datetime.now(timezone.utc)
-            for idx, (uuid,) in enumerate(profiles):
-                stale_time = (
-                    current_time
-                    - timedelta(hours=SCRAPER_STALE_HOURS + 1)
-                    + timedelta(seconds=idx * delay_per_profile)
-                )
-                # Update or create Mojang source update
-                mojang_update = session.query(SourceUpdate).filter_by(
-                    uuid=uuid, source='mojang'
-                ).first()
-                if not mojang_update:
-                    mojang_update = SourceUpdate(uuid=uuid, source='mojang')
-                    session.add(mojang_update)
-                mojang_update.last_updated_at = stale_time
-
-                # Update or create Scraper source update
-                scraper_update = session.query(SourceUpdate).filter_by(
-                    uuid=uuid, source='scraper'
-                ).first()
-                if not scraper_update:
-                    scraper_update = SourceUpdate(uuid=uuid, source='scraper')
-                    session.add(scraper_update)
-                scraper_update.last_updated_at = stale_time
-
-            log.info(f"Scheduled {total} profiles for refresh over 24 hours")
-            return jsonify(
-                {
-                    "message": f"Scheduled {total} profiles for gradual refresh",
-                    "total": total,
-                    "estimated_completion": "24 hours",
-                    "delay_per_profile": f"{delay_per_profile:.2f}s",
-                }
-            )
-    except Exception as e:
-        log.error("API error in refresh-all", exc_info=True)
-        abort(500)
-
-
-def run_debugger(username: str):
-    log.info(f"--- Running Debugger for {username} ---")
-    try:
-        html_a = fetch_profile_html(f"https://namemc.com/profile/{username}")
-        if html_a:
-            with open(f"debug_namemc_{username}.html", "w") as f:
-                f.write(html_a)
-            log.info(f"Saved debug_namemc_{username}.html")
-    except Exception as e:
-        log.error(f"Failed to fetch NameMC: {e}")
-    try:
-        normalized = normalize_username(username)
-        if normalized:
-            _, uuid = normalized
-            if uuid:
-                api_data = fetch_laby_api_data(uuid)
-                with open(f"debug_laby_api_{username}.json", "w") as f:
-                    json.dump(api_data, f, indent=2)
-                log.info(f"Saved debug_laby_api_{username}.json")
-    except Exception as e:
-        log.error(f"Failed to fetch Laby.net: {e}")
-
-
-def ensure_db():
-    """Ensure database exists and has the correct schema"""
-    if DB_TYPE == "postgresql":
-        # For PostgreSQL, we need to make sure the database exists
-        admin_url = db_url.rsplit('/', 1)[0] + '/postgres'
-        admin_engine = create_engine(admin_url)
-        
-        try:
-            with admin_engine.begin() as conn:
-                db_name = db_url.rsplit('/', 1)[1]
-                # Check if database exists
-                result = conn.execute(text(
-                    "SELECT 1 FROM pg_database WHERE datname = :db_name"
-                ), {"db_name": db_name})
-                
-                if not result.fetchone():
-                    # Need to commit current transaction before creating database
-                    conn.execute(text("COMMIT"))
-                    conn.execute(text(f"CREATE DATABASE {db_name}"))
-                    log.info(f"Created database {db_name}")
-        except Exception as e:
-            log.warning(f"Could not create database: {e}")
-        finally:
-            admin_engine.dispose()
     
-    # Create tables
-    Base.metadata.create_all(bind=engine)
-    log.info("Database schema initialized")
-
-
+# --- MAIN EXECUTION ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Minecraft Name History API")
-    parser.add_argument(
-        "--dump-html",
-        metavar="USERNAME",
-        help="Run in debug mode to download raw HTML/API data for a user instead of starting the server.",
-    )
-    parser.add_argument(
-        "command", nargs="?", help="Command to run: 'clean' to clean database"
-    )
-    args = parser.parse_args()
-
-    if args.dump_html:
-        run_debugger(args.dump_html)
-    elif args.command == "clean":
-        ensure_db()
-        clean_database()
-    else:
-        ensure_db()
-        log.info("DB initialized")
-
-        if AUTO_UPDATE_ENABLED:
-            update_thread = threading.Thread(target=auto_update_worker, daemon=True)
-            update_thread.start()
-            log.info("Auto-update worker enabled")
-
-        log.info("Starting Flask", extra={"host": HOST, "port": PORT})
-        app.run(host=HOST, port=PORT)
+    init_db()
+    log.info("DB initialized")
+    if AUTO_UPDATE_ENABLED:
+        # Placeholder for background worker thread if needed
+        pass
+    log.info(f"Starting Flask server on {HOST}:{PORT}")
+    app.run(host=HOST, port=PORT)
