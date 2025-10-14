@@ -207,12 +207,14 @@ def normalize_username(name: str) -> Optional[Tuple[str, Optional[str]]]:
         data = r.json()
         proper_name = data.get("name")
         uuid = data.get("id")
-        return (proper_name, dashed_uuid(uuid) if uuid else None)
+        if not uuid:
+            return None
+        return (proper_name, dashed_uuid(uuid))
     except Exception as e:
         log.warning(
             "Failed to normalize username", extra={"username": name, "error": str(e)}
         )
-        return (name, None)
+        return None
 
 
 def get_profile_by_uuid_from_mojang(uuid: str) -> Optional[str]:
@@ -657,6 +659,10 @@ def merge_remote_sources(
 
 def _update_profile_from_sources(uuid: str, current_name: str) -> Dict[str, Any]:
     """The authoritative function to fetch, merge, and save a profile's history."""
+    if not uuid:
+        log.error(f"Invalid UUID provided for {current_name}")
+        return {"query": current_name, "uuid": None, "last_seen_at": None, "history": []}
+
     log.info(
         "Updating profile from sources",
         extra={"uuid": uuid, "current_name": current_name},
@@ -668,7 +674,6 @@ def _update_profile_from_sources(uuid: str, current_name: str) -> Dict[str, Any]
         log.warning(
             "No historical data found from any source for profile", extra={"uuid": uuid}
         )
-        # Still proceed to save the profile info we have
 
     pairs = merge_remote_sources(rows)
 
@@ -836,6 +841,9 @@ def api_namehistory_by_username():
     if normalized:
         # Name exists on Mojang
         current_name, uuid = normalized
+        if not uuid:
+            abort(404, "Could not get UUID from Mojang API")
+
         log.info(
             "Mojang check: name exists", extra={"username": current_name, "uuid": uuid}
         )
