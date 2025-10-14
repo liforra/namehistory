@@ -14,7 +14,7 @@ PlayerHistoryAPI is a Python-based API server for retrieving, storing, and manag
 - **REST API** for querying by username or UUID
 - **Bulk update and refresh endpoints**
 - **Automatic background updates** for stale profiles
-- **SQLite database** for local caching and deduplication
+- **Multi-database support:** SQLite, MariaDB, MySQL, and PostgreSQL (via SQLAlchemy)
 - **Rate limiting** to prevent abuse
 - **Configurable via `config.toml`**
 - **Logging** with optional JSON output and file rotation
@@ -25,7 +25,7 @@ PlayerHistoryAPI is a Python-based API server for retrieving, storing, and manag
 
 1. **API Endpoints**: The Flask server exposes endpoints to query name history by username or UUID, trigger updates, and refresh all cached profiles.
 2. **Data Aggregation**: When a query is made, the server fetches data from Mojang (official), NameMC (scraped), and Laby.net (API), merges and deduplicates the results, and stores them locally.
-3. **Caching**: Results are cached in a local SQLite database. Stale data is automatically refreshed in the background.
+3. **Caching**: Results are cached in a local database (SQLite, MariaDB, MySQL, or PostgreSQL). Stale data is automatically refreshed in the background.
 4. **Rate Limiting**: Requests are rate-limited per IP to prevent abuse.
 5. **Configuration**: All major settings (server, rate limits, fetch delays, logging, etc.) can be customized in `config.toml`.
 
@@ -49,7 +49,7 @@ PlayerHistoryAPI is a Python-based API server for retrieving, storing, and manag
 
 ## Configuration
 
-Create a `config.toml` file in the project root to override defaults. Example:
+Create a `config.toml` file in the project root to override defaults. Example for all supported databases:
 
 ```toml
 [server]
@@ -60,8 +60,18 @@ port = 8080
 rpm = 10
 window_seconds = 60
 
+# --- Database config ---
+# Supported types: sqlite, mysql, mariadb, postgresql
 [database]
+# For SQLite:
+type = "sqlite"
 path = "namehistory.db"
+# For MySQL/MariaDB (requires PyMySQL):
+# type = "mysql"
+# url = "mysql+pymysql://user:password@localhost/dbname"
+# For PostgreSQL (requires psycopg2):
+# type = "postgresql"
+# url = "postgresql+psycopg2://user:password@localhost/dbname"
 
 [logging]
 level = "DEBUG"
@@ -85,22 +95,27 @@ batch_size = 10
    pip install -r requirements.txt
    ```
 2. **(Optional) Create and edit `config.toml`**
-3. **Initialize the database and start the server:**
+3. **Set up your database backend:**
+   - For SQLite (default): no extra setup needed
+   - For MySQL/MariaDB: ensure the database exists and the user has permissions
+   - For PostgreSQL: ensure the database exists and the user has permissions
+4. **Initialize the database and start the server:**
    ```bash
    python main.py
    ```
-4. **(Optional) Clean the database:**
+5. **(Optional) Clean the database:**
    ```bash
    python main.py clean
    ```
-5. **(Optional) Debug mode (download raw HTML/API data):**
+6. **(Optional) Debug mode (download raw HTML/API data):**
    ```bash
    python main.py --dump-html <username>
    ```
 
 ## Database
 
-- Uses SQLite (`namehistory.db` by default)
+- Uses SQLite (`namehistory.db` by default), or MariaDB, MySQL, or PostgreSQL if configured
+- All database access is via SQLAlchemy ORM
 - Stores profiles, name history, provider details, and update timestamps
 - Cleans up duplicate entries with the `clean` command
 
@@ -118,6 +133,9 @@ batch_size = 10
 - curl_cffi
 - beautifulsoup4
 - tomli (for TOML config)
+- SQLAlchemy (for multi-database support)
+- PyMySQL (for MySQL/MariaDB)
+- psycopg2-binary (for PostgreSQL)
 
 ## Legal Notice
 

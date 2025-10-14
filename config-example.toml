@@ -1,0 +1,36 @@
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[rate_limit]
+rpm = 5
+window_seconds = 60
+
+[fetch]
+fuzzy_window_days = 1
+default_sleep = 0.5
+bulk_min_delay = 0.8
+bulk_max_delay = 1.5
+
+[database]
+# Supported: sqlite, mysql, mariadb, postgresql
+type = "sqlite"
+# For SQLite, use a file path. For others, use a SQLAlchemy URL.
+path = "namehistory.db"
+# Example for MySQL/MariaDB: "mysql+pymysql://user:password@localhost/dbname"
+# Example for PostgreSQL: "postgresql+psycopg2://user:password@localhost/dbname"
+# url = ""
+
+[logging]
+level = "INFO"
+json = false
+file = ""
+max_bytes = 10485760
+backup_count = 3
+
+[auto_update]
+enabled = true
+check_interval_minutes = 60
+mojang_stale_hours = 6
+scraper_stale_hours = 24
+batch_size = 10

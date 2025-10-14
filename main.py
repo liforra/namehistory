@@ -6,7 +6,11 @@ import re
 import time
 import json
 import random
-import sqlite3
+from sqlalchemy import (
+    create_engine, Column, String, Integer, DateTime, ForeignKey, UniqueConstraint, Index, Text
+)
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship, scoped_session
+from sqlalchemy.exc import SQLAlchemyError
 import threading
 import argparse
 from contextlib import contextmanager
@@ -71,7 +75,9 @@ load_config()
 
 HOST = CONFIG["server"]["host"]
 PORT = int(CONFIG["server"]["port"])
-DB_PATH = CONFIG["database"]["path"]
+DB_TYPE = CONFIG["database"].get("type", "sqlite")
+DB_PATH = CONFIG["database"].get("path", "namehistory.db")
+DB_URL = CONFIG["database"].get("url", None)
 FUZZY_WINDOW = timedelta(days=float(CONFIG["fetch"]["fuzzy_window_days"]))
 DEFAULT_SLEEP = float(CONFIG["fetch"]["default_sleep"])
 BULK_MIN_DELAY = float(CONFIG["fetch"]["bulk_min_delay"])
@@ -332,18 +338,64 @@ def parse_iso(dt: Optional[str]) -> Optional[datetime]:
         return None
 
 
-DB_LOCK = threading.Lock()
-SCHEMA = """
-PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;
-CREATE TABLE IF NOT EXISTS profiles (uuid TEXT PRIMARY KEY, query TEXT, last_seen_at TEXT);
-CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, uuid TEXT NOT NULL, name TEXT NOT NULL, changed_at TEXT, observed_at TEXT NOT NULL, UNIQUE(uuid, name, changed_at), FOREIGN KEY (uuid) REFERENCES profiles(uuid) ON DELETE CASCADE);
-CREATE TABLE IF NOT EXISTS provider_details (id INTEGER PRIMARY KEY AUTOINCREMENT, history_id INTEGER NOT NULL, provider TEXT NOT NULL, provider_changed_at TEXT, UNIQUE(history_id, provider, provider_changed_at), FOREIGN KEY (history_id) REFERENCES history(id) ON DELETE CASCADE);
-CREATE TABLE IF NOT EXISTS source_updates (uuid TEXT NOT NULL, source TEXT NOT NULL, last_updated_at TEXT NOT NULL, PRIMARY KEY (uuid, source), FOREIGN KEY (uuid) REFERENCES profiles(uuid) ON DELETE CASCADE);
-CREATE INDEX IF NOT EXISTS idx_history_uuid ON history(uuid);
-CREATE INDEX IF NOT EXISTS idx_history_uuid_changed ON history(uuid, changed_at);
-CREATE INDEX IF NOT EXISTS idx_history_name ON history(name COLLATE NOCASE);
-CREATE INDEX IF NOT EXISTS idx_source_updates_time ON source_updates(source, last_updated_at);
-"""
+
+# --- SQLAlchemy Setup ---
+Base = declarative_base()
+
+class Profile(Base):
+    __tablename__ = "profiles"
+    uuid = Column(String(36), primary_key=True)
+    query = Column(String(32))
+    last_seen_at = Column(DateTime)
+    history = relationship("History", back_populates="profile", cascade="all, delete-orphan")
+    source_updates = relationship("SourceUpdate", back_populates="profile", cascade="all, delete-orphan")
+
+class History(Base):
+    __tablename__ = "history"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    uuid = Column(String(36), ForeignKey("profiles.uuid", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String(32), nullable=False, index=True)
+    changed_at = Column(String(32), index=True)
+    observed_at = Column(DateTime, nullable=False)
+    profile = relationship("Profile", back_populates="history")
+    provider_details = relationship("ProviderDetail", back_populates="history", cascade="all, delete-orphan")
+    __table_args__ = (
+        UniqueConstraint("uuid", "name", "changed_at"),
+    )
+
+class ProviderDetail(Base):
+    __tablename__ = "provider_details"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    history_id = Column(Integer, ForeignKey("history.id", ondelete="CASCADE"), nullable=False)
+    provider = Column(String(32), nullable=False)
+    provider_changed_at = Column(String(32))
+    history = relationship("History", back_populates="provider_details")
+    __table_args__ = (
+        UniqueConstraint("history_id", "provider", "provider_changed_at"),
+    )
+
+class SourceUpdate(Base):
+    __tablename__ = "source_updates"
+    uuid = Column(String(36), ForeignKey("profiles.uuid", ondelete="CASCADE"), primary_key=True)
+    source = Column(String(32), primary_key=True)
+    last_updated_at = Column(DateTime, nullable=False, index=True)
+    profile = relationship("Profile", back_populates="source_updates")
+
+# --- Engine selection ---
+if DB_TYPE == "sqlite":
+    db_url = f"sqlite:///{DB_PATH}"
+elif DB_TYPE in ("mysql", "mariadb"):
+    db_url = DB_URL or f"mysql+pymysql://user:password@localhost/namehistory"
+elif DB_TYPE == "postgresql":
+    db_url = DB_URL or f"postgresql+psycopg2://user:password@localhost/namehistory"
+else:
+    raise RuntimeError(f"Unsupported DB type: {DB_TYPE}")
+
+engine = create_engine(db_url, echo=False, future=True)
+SessionLocal = scoped_session(sessionmaker(bind=engine, autoflush=False, autocommit=False))
+
+def init_db():
+    Base.metadata.create_all(bind=engine)
 
 
 def connect_db() -> sqlite3.Connection:
@@ -357,221 +409,142 @@ def init_db():
         con.executescript(SCHEMA)
 
 
+
 @contextmanager
-def tx() -> sqlite3.Connection:
-    with DB_LOCK:
-        con = connect_db()
-        try:
-            con.execute("BEGIN IMMEDIATE")
-            yield con
-            con.execute("COMMIT")
-        except:
-            con.execute("ROLLBACK")
-            raise
-        finally:
-            con.close()
+def tx():
+    session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 
-def ensure_profile(con: sqlite3.Connection, uuid: str, query: Optional[str]) -> None:
-    cur = con.execute("SELECT uuid FROM profiles WHERE uuid = ?", (uuid,))
-    if cur.fetchone() is None:
-        con.execute(
-            "INSERT INTO profiles (uuid, query, last_seen_at) VALUES (?, ?, ?)",
-            (uuid, query, now_iso()),
-        )
+def ensure_profile(session, uuid: str, query: Optional[str]) -> None:
+    profile = session.get(Profile, uuid)
+    now = datetime.now(timezone.utc)
+    if not profile:
+        profile = Profile(uuid=uuid, query=query, last_seen_at=now)
+        session.add(profile)
     else:
-        con.execute(
-            "UPDATE profiles SET query = ?, last_seen_at = ? WHERE uuid = ?",
-            (query, now_iso(), uuid),
-        )
+        profile.query = query
+        profile.last_seen_at = now
 
 
-def get_profile_by_uuid(con: sqlite3.Connection, uuid: str) -> Optional[sqlite3.Row]:
-    return con.execute("SELECT * FROM profiles WHERE uuid = ?", (uuid,)).fetchone()
+def get_profile_by_uuid(session, uuid: str):
+    return session.get(Profile, uuid)
 
 
-def get_uuid_from_history_by_name(
-    con: sqlite3.Connection, username: str
-) -> Optional[str]:
-    """Find a UUID from the history table based on a past username."""
-    row = con.execute(
-        "SELECT uuid FROM history WHERE name = ? COLLATE NOCASE ORDER BY observed_at DESC LIMIT 1",
-        (username,),
-    ).fetchone()
-    return row["uuid"] if row else None
-
-
-def update_source_timestamp(con: sqlite3.Connection, uuid: str, source: str) -> None:
-    """Track when a source was last updated for a profile"""
-    con.execute(
-        "INSERT OR REPLACE INTO source_updates (uuid, source, last_updated_at) VALUES (?, ?, ?)",
-        (uuid, source, now_iso()),
+def get_uuid_from_history_by_name(session, username: str) -> Optional[str]:
+    row = (
+        session.query(History.uuid)
+        .filter(History.name.ilike(username))
+        .order_by(History.observed_at.desc())
+        .first()
     )
+    return row[0] if row else None
 
 
-def is_source_stale(
-    con: sqlite3.Connection, uuid: str, source: str, stale_hours: int
-) -> bool:
-    """Check if a source needs updating"""
-    row = con.execute(
-        "SELECT last_updated_at FROM source_updates WHERE uuid = ? AND source = ?",
-        (uuid, source),
-    ).fetchone()
-    if not row or not row["last_updated_at"]:
+def update_source_timestamp(session, uuid: str, source: str) -> None:
+    now = datetime.now(timezone.utc)
+    su = session.query(SourceUpdate).filter_by(uuid=uuid, source=source).first()
+    if not su:
+        su = SourceUpdate(uuid=uuid, source=source, last_updated_at=now)
+        session.add(su)
+    else:
+        su.last_updated_at = now
+
+
+def is_source_stale(session, uuid: str, source: str, stale_hours: int) -> bool:
+    su = session.query(SourceUpdate).filter_by(uuid=uuid, source=source).first()
+    if not su or not su.last_updated_at:
         return True
-    last_updated = parse_iso(row["last_updated_at"])
-    if not last_updated:
-        return True
-    age = datetime.now(timezone.utc) - last_updated
+    age = datetime.now(timezone.utc) - su.last_updated_at
     return age.total_seconds() > (stale_hours * 3600)
 
 
-def insert_or_merge_history(
-    con: sqlite3.Connection,
-    uuid: str,
-    name: str,
-    changed_at: Optional[str],
-    provider: str,
-    provider_changed_at: Optional[str],
-) -> None:
-    if not is_censored(name) and changed_at is not None:
-        cur = con.execute(
-            "SELECT id, name FROM history WHERE uuid = ? AND changed_at = ?",
-            (uuid, changed_at),
-        )
-        for row in cur.fetchall():
-            if is_censored(row["name"]):
-                con.execute(
-                    "UPDATE history SET name = ? WHERE id = ?", (name, row["id"])
-                )
-                con.execute(
-                    "INSERT OR IGNORE INTO provider_details (history_id, provider, provider_changed_at) VALUES (?,?,?)",
-                    (row["id"], provider, provider_changed_at),
-                )
-                logging.getLogger("merge").info(
-                    "Uncensor upgrade",
-                    extra={"uuid": uuid, "ts": changed_at, "username": name},
-                )
-                return
+def insert_or_merge_history(session, uuid: str, name: str, changed_at: Optional[str], provider: str, provider_changed_at: Optional[str]) -> None:
+    # Try to find an existing history entry (fuzzy or exact)
     ta = parse_iso(changed_at)
-    if ta:
-        cur = con.execute(
-            "SELECT id, changed_at FROM history WHERE uuid = ? AND name = ?",
-            (uuid, name),
-        )
-        for row in cur.fetchall():
-            tb = parse_iso(row["changed_at"])
-            if tb and abs(ta - tb) <= FUZZY_WINDOW:
-                if row["changed_at"] is None:
-                    con.execute(
-                        "UPDATE history SET changed_at = ? WHERE id = ?",
-                        (changed_at, row["id"]),
-                    )
-                con.execute(
-                    "INSERT OR IGNORE INTO provider_details (history_id, provider, provider_changed_at) VALUES (?,?,?)",
-                    (row["id"], provider, provider_changed_at),
-                )
-                logging.getLogger("merge").info(
-                    "Fuzzy-merged",
-                    extra={
-                        "uuid": uuid,
-                        "username": name,
-                        "from": row["changed_at"],
-                        "to": changed_at,
-                    },
-                )
+    if not is_censored(name) and changed_at is not None:
+        q = session.query(History).filter_by(uuid=uuid, changed_at=changed_at)
+        for row in q:
+            if is_censored(row.name):
+                row.name = name
+                pd = ProviderDetail(history_id=row.id, provider=provider, provider_changed_at=provider_changed_at)
+                session.merge(pd)
+                logging.getLogger("merge").info("Uncensor upgrade", extra={"uuid": uuid, "ts": changed_at, "username": name})
                 return
-    con.execute(
-        "INSERT OR IGNORE INTO history (uuid, name, changed_at, observed_at) VALUES (?,?,?,?)",
-        (uuid, name, changed_at, now_iso()),
-    )
-    cur = con.execute(
-        "SELECT id FROM history WHERE uuid = ? AND name = ? AND (changed_at = ? OR (changed_at IS NULL AND ? IS NULL))",
-        (uuid, name, changed_at, changed_at),
-    )
-    result = cur.fetchone()
-    if result:
-        hid = result["id"]
-        con.execute(
-            "INSERT OR IGNORE INTO provider_details (history_id, provider, provider_changed_at) VALUES (?,?,?)",
-            (hid, provider, provider_changed_at),
-        )
-        logging.getLogger("merge").info(
-            "Inserted history",
-            extra={"uuid": uuid, "username": name, "changed_at": changed_at},
-        )
+    if ta:
+        q = session.query(History).filter_by(uuid=uuid, name=name)
+        for row in q:
+            tb = parse_iso(row.changed_at)
+            if tb and abs(ta - tb) <= FUZZY_WINDOW:
+                if row.changed_at is None:
+                    row.changed_at = changed_at
+                pd = ProviderDetail(history_id=row.id, provider=provider, provider_changed_at=provider_changed_at)
+                session.merge(pd)
+                logging.getLogger("merge").info("Fuzzy-merged", extra={"uuid": uuid, "username": name, "from": row.changed_at, "to": changed_at})
+                return
+    # Insert new history if not found
+    observed_at = datetime.now(timezone.utc)
+    h = History(uuid=uuid, name=name, changed_at=changed_at, observed_at=observed_at)
+    session.merge(h)
+    session.flush()
+    hid = h.id
+    pd = ProviderDetail(history_id=hid, provider=provider, provider_changed_at=provider_changed_at)
+    session.merge(pd)
+    logging.getLogger("merge").info("Inserted history", extra={"uuid": uuid, "username": name, "changed_at": changed_at})
 
 
-def ensure_current_entry(con: sqlite3.Connection, uuid: str, current_name: str) -> None:
-    """
-    Ensures that an undated entry for the current name exists. This prevents duplicates.
-    """
+def ensure_current_entry(session, uuid: str, current_name: str) -> None:
     # Check if an undated entry for the current name already exists.
-    cur = con.execute(
-        "SELECT id FROM history WHERE uuid = ? AND name = ? AND changed_at IS NULL",
-        (uuid, current_name),
-    )
-    if cur.fetchone():
-        # It exists, do nothing.
+    exists = session.query(History).filter_by(uuid=uuid, name=current_name, changed_at=None).first()
+    if exists:
         return
-
-    # It does not exist, so we must add it.
-    log.info(
-        "Adding missing 'Current' entry", extra={"uuid": uuid, "username": current_name}
-    )
-    insert_or_merge_history(con, uuid, current_name, None, "current", None)
+    log.info("Adding missing 'Current' entry", extra={"uuid": uuid, "username": current_name})
+    insert_or_merge_history(session, uuid, current_name, None, "current", None)
 
 
-def query_history_public(con: sqlite3.Connection, uuid: str) -> Dict[str, Any]:
-    p = get_profile_by_uuid(con, uuid)
+def query_history_public(session, uuid: str) -> Dict[str, Any]:
+    p = get_profile_by_uuid(session, uuid)
     if not p:
         return {"query": None, "uuid": uuid, "last_seen_at": None, "history": []}
 
-    cur = con.execute(
-        "SELECT name, changed_at, observed_at FROM history WHERE uuid = ?", (uuid,)
-    )
-    rows = cur.fetchall()
-
+    rows = session.query(History).filter_by(uuid=uuid).all()
     dated = []
     undated = []
-
     for r in rows:
-        if r["changed_at"] is not None:
-            dated.append(dict(r))
+        d = {
+            "name": r.name,
+            "changed_at": r.changed_at,
+            "observed_at": r.observed_at,
+        }
+        if r.changed_at is not None:
+            dated.append(d)
         else:
-            undated.append(dict(r))
-
+            undated.append(d)
     dated.sort(key=lambda x: x["changed_at"])
     undated.sort(key=lambda x: x["observed_at"])
-
-    # Identify the true original name (earliest observed, undated)
     original_name_entry = undated[0] if undated else None
-
-    # Identify the true current name (latest observed, undated)
     current_name_entry = undated[-1] if undated else None
-
-    # Build the final list
     final_list = []
     if original_name_entry:
         final_list.append(original_name_entry)
-
-    # Add dated history, ensuring no overlap with the original name
     for entry in dated:
         if not original_name_entry or (entry["name"] != original_name_entry["name"]):
             final_list.append(entry)
-
-    # Add current name if it's different from original and last dated
     if current_name_entry:
         is_original = (
             original_name_entry
             and current_name_entry["observed_at"] == original_name_entry["observed_at"]
         )
         is_last_dated = dated and current_name_entry["name"] == dated[-1]["name"]
-
         if not is_original and not is_last_dated:
             final_list.append(current_name_entry)
-
-    # Deduplicate the final list based on name and changed_at
     seen = set()
     deduplicated_list = []
     for item in final_list:
@@ -579,23 +552,19 @@ def query_history_public(con: sqlite3.Connection, uuid: str) -> Dict[str, Any]:
         if key not in seen:
             seen.add(key)
             deduplicated_list.append(item)
-
     items = []
     for idx, r in enumerate(deduplicated_list):
-        items.append(
-            {
-                "id": idx + 1,
-                "name": r["name"],
-                "changed_at": r["changed_at"],
-                "observed_at": r["observed_at"],
-                "censored": is_censored(r["name"]),
-            }
-        )
-
+        items.append({
+            "id": idx + 1,
+            "name": r["name"],
+            "changed_at": r["changed_at"],
+            "observed_at": r["observed_at"],
+            "censored": is_censored(r["name"]),
+        })
     return {
-        "query": p["query"],
-        "uuid": p["uuid"],
-        "last_seen_at": p["last_seen_at"],
+        "query": p.query,
+        "uuid": p.uuid,
+        "last_seen_at": p.last_seen_at,
         "history": items,
     }
 
@@ -722,41 +691,29 @@ def _update_profile_from_sources(uuid: str, current_name: str) -> Dict[str, Any]
 
 
 def clean_database():
-    """Remove duplicate names from history, keeping only unique entries"""
     log.info("=" * 60)
     log.info("Starting database cleanup...")
     log.info("=" * 60)
-
-    with tx() as con:
-        profiles = con.execute("SELECT uuid, query FROM profiles").fetchall()
+    with tx() as session:
+        profiles = session.query(Profile).all()
         total_deleted = 0
-
         for profile in profiles:
-            uuid = profile["uuid"]
-
-            # Find all undated entries for the current name
-            current_name = profile["query"]
-            cur = con.execute(
-                "SELECT id, observed_at FROM history WHERE uuid = ? AND name = ? AND changed_at IS NULL ORDER BY observed_at DESC",
-                (uuid, current_name),
+            uuid = profile.uuid
+            current_name = profile.query
+            duplicate_currents = (
+                session.query(History)
+                .filter_by(uuid=uuid, name=current_name, changed_at=None)
+                .order_by(History.observed_at.desc())
+                .all()
             )
-            duplicate_currents = cur.fetchall()
-
             if len(duplicate_currents) > 1:
-                # Keep the newest one, delete the rest
-                ids_to_delete = [row["id"] for row in duplicate_currents[1:]]
+                ids_to_delete = [row.id for row in duplicate_currents[1:]]
                 for row_id in ids_to_delete:
-                    con.execute("DELETE FROM history WHERE id = ?", (row_id,))
+                    session.query(History).filter_by(id=row_id).delete()
                 total_deleted += len(ids_to_delete)
-                log.info(
-                    f"Removed {len(ids_to_delete)} duplicate 'Current' entries for {current_name}",
-                    extra={"uuid": uuid},
-                )
-
+                log.info(f"Removed {len(ids_to_delete)} duplicate 'Current' entries for {current_name}", extra={"uuid": uuid})
         log.info("=" * 60)
-        log.info(
-            f"Database cleanup complete! Deleted {total_deleted} duplicate entries."
-        )
+        log.info(f"Database cleanup complete! Deleted {total_deleted} duplicate entries.")
         log.info("=" * 60)
 
 
