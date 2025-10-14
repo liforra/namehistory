@@ -242,14 +242,14 @@ def merge_remote_sources(rows: List[Dict[str, Optional[str]]], current_name: str
     """
     Intelligently merge data from multiple sources.
     
-    Key insight: You can't change from "Liforra" to "Liforra". 
-    If the same name appears with multiple timestamps, they're all describing 
-    the SAME historical name change - keep the earliest.
-    
-    Name reuse only happens when there are OTHER names in between.
+    Key insights:
+    1. You can't change from "Name" to "Name" - consecutive duplicates are the same event
+    2. A name with null timestamp might not actually be the original - if we have a dated 
+       occurrence of the same name, the null is likely incomplete data
+    3. Name reuse is detected when OTHER names appear in between
     """
     
-    # Step 1: Normalize all timestamps and group by (name, normalized_timestamp)
+    # Step 1: Normalize all timestamps
     normalized_entries = []
     for row in rows:
         name = row.get("name")
@@ -257,7 +257,6 @@ def merge_remote_sources(rows: List[Dict[str, Optional[str]]], current_name: str
         source = row.get("source", "unknown")
         
         if name:
-            # Parse to datetime, then back to consistent ISO format
             normalized_ts = normalize_timestamp(changed_at)
             normalized_entries.append({
                 "name": name,
@@ -268,40 +267,60 @@ def merge_remote_sources(rows: List[Dict[str, Optional[str]]], current_name: str
     
     log.debug(f"Processing {len(normalized_entries)} entries from all sources")
     
-    # Step 2: Sort all entries chronologically (None first, then by datetime)
-    normalized_entries.sort(key=lambda e: e["datetime"] or datetime.min.replace(tzinfo=timezone.utc))
-    
-    # Step 3: Build the merged sequence by removing consecutive duplicates
-    merged = []
+    # Step 2: Group by name to detect conflicting null vs dated timestamps
+    by_name = defaultdict(list)
     for entry in normalized_entries:
+        by_name[entry["name"].lower()].append(entry)
+    
+    # Step 3: For each name, if it has BOTH null and dated timestamps, remove the null
+    # (the null is likely incomplete data from a source that didn't scrape early enough)
+    cleaned_entries = []
+    for name_lower, entries in by_name.items():
+        has_null = any(e["timestamp"] is None for e in entries)
+        has_dated = any(e["timestamp"] is not None for e in entries)
+        
+        if has_null and has_dated:
+            # Discard null timestamps - they're incomplete data
+            log.debug(f"  Name '{entries[0]['name']}' has both null and dated timestamps - discarding null (incomplete data)")
+            cleaned_entries.extend([e for e in entries if e["timestamp"] is not None])
+        else:
+            # Keep all entries
+            cleaned_entries.extend(entries)
+    
+    log.debug(f"After removing incomplete nulls: {len(cleaned_entries)} entries")
+    
+    # Step 4: Sort chronologically (None first, then by datetime)
+    cleaned_entries.sort(key=lambda e: e["datetime"] or datetime.min.replace(tzinfo=timezone.utc))
+    
+    # Step 5: Remove consecutive duplicates (same name appearing multiple times in a row)
+    merged = []
+    for entry in cleaned_entries:
         name = entry["name"]
         timestamp = entry["timestamp"]
         source = entry["source"]
         
-        # Check if this is a duplicate of the previous entry
+        # Check if this is a consecutive duplicate
         if merged:
             last_name, last_timestamp = merged[-1]
             
-            # Same name as previous entry
+            # Same name as previous entry = consecutive duplicate
             if name.lower() == last_name.lower():
-                # This is the same name change, just detected later
                 # Keep the earlier timestamp
                 last_dt = parse_timestamp(last_timestamp)
                 curr_dt = parse_timestamp(timestamp)
                 
                 if curr_dt and last_dt and curr_dt < last_dt:
-                    # Current timestamp is earlier - replace
-                    log.debug(f"  Replacing {last_name} timestamp {last_timestamp} with earlier {timestamp} (from {source})")
+                    log.debug(f"  Replacing {last_name} @ {last_timestamp} with earlier {timestamp} (from {source})")
                     merged[-1] = (name, timestamp)
                 else:
-                    log.debug(f"  Skipping duplicate {name} timestamp {timestamp} (from {source}) - already have {last_timestamp}")
+                    log.debug(f"  Skipping consecutive duplicate {name} @ {timestamp} (from {source})")
                 continue
         
-        # Not a duplicate - add it
-        log.debug(f"  Adding {name} at {timestamp} (from {source})")
+        # Not a consecutive duplicate - add it
+        log.debug(f"  Adding {name} @ {timestamp} (from {source})")
         merged.append((name, timestamp))
     
-    # Step 4: Ensure current name is in the list
+    # Step 6: Ensure current name is in the list
     if merged:
         last_name, _ = merged[-1]
         if last_name.lower() != current_name.lower():
