@@ -14,23 +14,20 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import (
     create_engine, Column, String, Integer, DateTime, ForeignKey, 
-    UniqueConstraint, Index, Text, select, update, insert, text
+    UniqueConstraint, Text, text
 )
 from sqlalchemy.orm import (
-    sessionmaker, declarative_base, relationship, scoped_session, 
-    Session, joinedload
+    sessionmaker, declarative_base, relationship, scoped_session
 )
-from sqlalchemy.exc import SQLAlchemyError
-
 from curl_cffi.requests import Session
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, jsonify, request, abort
-from werkzeug.exceptions import HTTPException, ServiceUnavailable
+from werkzeug.exceptions import HTTPException
 
 try:
     import tomli as toml
-except Exception:
+except ImportError:
     toml = None
 
 import logging
@@ -39,27 +36,20 @@ from logging.handlers import RotatingFileHandler
 # --- CONFIGURATION ---
 CONFIG: Dict[str, Any] = {
     "server": {"host": "127.0.0.1", "port": 8000},
-    "rate_limit": {"rpm": 5, "window_seconds": 60},
+    "rate_limit": {"rpm": 15, "window_seconds": 60},
     "fetch": {
-        "fuzzy_window_days": 1,
         "default_sleep": 0.5,
         "bulk_min_delay": 0.8,
         "bulk_max_delay": 1.5,
     },
-    "database": {"path": "namehistory.db"},
+    "database": {"type": "sqlite", "path": "namehistory.db"},
     "logging": {
-        "level": "INFO",
-        "json": False,
-        "file": "",
-        "max_bytes": 10_485_760,
-        "backup_count": 3,
+        "level": "INFO", "json": False, "file": "", 
+        "max_bytes": 10_485_760, "backup_count": 3
     },
     "auto_update": {
-        "enabled": True,
-        "check_interval_minutes": 60,
-        "mojang_stale_hours": 6,
-        "scraper_stale_hours": 24,
-        "batch_size": 10,
+        "enabled": True, "check_interval_minutes": 60,
+        "scraper_stale_hours": 24, "batch_size": 10,
     },
 }
 
@@ -82,16 +72,13 @@ PORT = int(CONFIG["server"]["port"])
 DB_TYPE = CONFIG["database"].get("type", "sqlite")
 DB_PATH = CONFIG["database"].get("path", "namehistory.db")
 DB_URL = CONFIG["database"].get("url", None)
-FUZZY_WINDOW = timedelta(days=float(CONFIG["fetch"]["fuzzy_window_days"]))
 DEFAULT_SLEEP = float(CONFIG["fetch"]["default_sleep"])
 BULK_MIN_DELAY = float(CONFIG["fetch"]["bulk_min_delay"])
 BULK_MAX_DELAY = float(CONFIG["fetch"]["bulk_max_delay"])
 RATE_LIMIT_RPM = int(CONFIG["rate_limit"]["rpm"])
 RATE_LIMIT_WINDOW = float(CONFIG["rate_limit"]["window_seconds"])
-
 AUTO_UPDATE_ENABLED = bool(CONFIG["auto_update"]["enabled"])
 AUTO_UPDATE_CHECK_INTERVAL = int(CONFIG["auto_update"]["check_interval_minutes"]) * 60
-MOJANG_STALE_HOURS = int(CONFIG["auto_update"]["mojang_stale_hours"])
 SCRAPER_STALE_HOURS = int(CONFIG["auto_update"]["scraper_stale_hours"])
 AUTO_UPDATE_BATCH_SIZE = int(CONFIG["auto_update"]["batch_size"])
 
@@ -105,22 +92,15 @@ def setup_logging():
 
     class JsonFormatter(logging.Formatter):
         def format(self, record: logging.LogRecord) -> str:
-            payload = {
-                "level": record.levelname,
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "msg": record.getMessage(),
-                "logger": record.name,
-            }
-            if record.exc_info:
-                payload["exc"] = self.formatException(record.exc_info)
+            payload = {"level": record.levelname, "ts": datetime.now(timezone.utc).isoformat(), "msg": record.getMessage()}
+            if record.exc_info: payload["exc"] = self.formatException(record.exc_info)
             return json.dumps(payload, ensure_ascii=False)
 
     root = logging.getLogger()
     if root.handlers:
-        for handler in root.handlers:
-            root.removeHandler(handler)
+        for handler in root.handlers: root.removeHandler(handler)
     root.setLevel(getattr(logging, lvl, logging.INFO))
-    fmt = JsonFormatter() if json_mode else logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    fmt = JsonFormatter() if json_mode else logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
     ch = logging.StreamHandler()
     ch.setFormatter(fmt)
     root.addHandler(ch)
@@ -133,21 +113,14 @@ setup_logging()
 log = logging.getLogger("namehistory")
 
 # --- HTTP & UTILS ---
-UA_POOL = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
-]
+UA_POOL = ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"]
 scraper_session = Session(impersonate="chrome110")
 mojang_session = requests.Session()
-
-def jitter_sleep(base: float = DEFAULT_SLEEP):
-    time.sleep(base + random.uniform(0.05, 0.2))
-
-def bulk_sleep():
-    time.sleep(random.uniform(BULK_MIN_DELAY, BULK_MAX_DELAY))
-
 MCS_LOOKUP = "https://api.minecraftservices.com/minecraft/profile/lookup/name/{name}"
 MCS_PROFILE = "https://sessionserver.mojang.com/session/minecraft/profile/{uuid}"
+
+def jitter_sleep(base: float = DEFAULT_SLEEP): time.sleep(base + random.uniform(0.05, 0.2))
+def bulk_sleep(): time.sleep(random.uniform(BULK_MIN_DELAY, BULK_MAX_DELAY))
 
 def dashed_uuid(raw: str) -> str:
     raw = raw.replace("-", "").strip()
@@ -156,68 +129,50 @@ def dashed_uuid(raw: str) -> str:
         return f"{s[0:8]}-{s[8:12]}-{s[12:16]}-{s[16:20]}-{s[20:32]}"
     return raw
 
-def parse_iso(dt: Optional[str]) -> Optional[datetime]:
-    if not dt: return None
-    try: return datetime.fromisoformat(dt.replace("Z", "+00:00"))
-    except: return None
-
 # --- DATA FETCHING ---
-def normalize_username(name: str) -> Optional[Tuple[str, Optional[str]]]:
+def normalize_username(name: str) -> Optional[Tuple[str, str]]:
     try:
         r = mojang_session.get(MCS_LOOKUP.format(name=name), timeout=10.0)
-        if r.status_code == 404: return None
-        r.raise_for_status()
+        if r.status_code != 200: return None
         data = r.json()
         return (data.get("name"), dashed_uuid(data.get("id")))
-    except Exception as e:
-        log.warning("Failed to normalize username", extra={"username": name, "error": str(e)})
-        return None
+    except Exception: return None
 
 def get_profile_by_uuid_from_mojang(uuid: str) -> Optional[str]:
     try:
         r = mojang_session.get(MCS_PROFILE.format(uuid=uuid.replace("-", "")), timeout=10.0)
         return r.json().get("name") if r.status_code == 200 else None
-    except Exception as e:
-        log.error("Failed to get profile by UUID from Mojang", extra={"uuid": uuid, "error": str(e)})
-        return None
+    except Exception: return None
+
+def fetch_profile_html(url: str) -> str:
+    try:
+        r = scraper_session.get(url, headers={"User-Agent": random.choice(UA_POOL)}, timeout=15.0)
+        return r.text if r.status_code == 200 else ""
+    except Exception: return ""
 
 def fetch_namemc_data(username: str) -> List[Dict[str, Optional[str]]]:
-    try:
-        url = f"https://namemc.com/profile/{username}"
-        html = fetch_profile_html(url)
-        if not html: return []
-        soup = BeautifulSoup(html, "html.parser")
-        header = soup.find(string=re.compile(r"^\s*Name History\s*$"))
-        if not header: return []
-        card = header.find_parent(class_="card")
-        if not card or not card.find("table"): return []
-        
-        out = []
-        for row in card.find("tbody").find_all("tr"):
-            name_tag = row.select_one("td a")
-            time_tag = row.find("time", datetime=True)
-            if name_tag:
-                out.append({
-                    "name": name_tag.get_text(strip=True),
-                    "changedAt": time_tag["datetime"].strip() if time_tag else None
-                })
-        return out
-    except Exception as e:
-        log.error("NameMC fetch failed", extra={"username": username, "error": str(e)})
-        return []
+    html = fetch_profile_html(f"https://namemc.com/profile/{username}")
+    if not html: return []
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.select_one('table.table-striped')
+    if not table: return []
+    out = []
+    for row in table.find("tbody").find_all("tr"):
+        cells = row.find_all("td")
+        if len(cells) > 0:
+            name = cells[0].get_text(strip=True)
+            time_tag = cells[1].find("time") if len(cells) > 1 else None
+            changed_at = time_tag["datetime"].strip() if time_tag else None
+            out.append({"name": name, "changedAt": changed_at})
+    return out
 
 def fetch_laby_api_data(uuid: str) -> List[Dict[str, Optional[str]]]:
     url = f"https://laby.net/api/user/{uuid}/get-names"
     try:
         r = scraper_session.get(url, headers={"Accept": "application/json"}, timeout=10)
-        if r.status_code != 200:
-            log.error("Laby.net API fetch failed", extra={"url": url, "status": r.status_code})
-            return []
-        data = r.json()
-        return [{"name": e.get("name"), "changedAt": e.get("changed_at")} for e in data if e.get("name")]
-    except Exception as e:
-        log.error("Laby.net API fetch/parse failed", extra={"url": url, "error": str(e)})
-        return []
+        if r.status_code != 200: return []
+        return [{"name": e.get("name"), "changedAt": e.get("changed_at")} for e in r.json() if e.get("name")]
+    except Exception: return []
 
 def gather_remote_rows_by_uuid(uuid: str) -> List[Dict[str, Optional[str]]]:
     rows = []
@@ -229,24 +184,24 @@ def gather_remote_rows_by_uuid(uuid: str) -> List[Dict[str, Optional[str]]]:
     return rows
 
 def merge_remote_sources(rows: List[Dict[str, Optional[str]]]) -> List[Tuple[str, Optional[str]]]:
-    unique_entries = {}
+    name_map: Dict[str, Tuple[str, Optional[str]]] = {}
     for row in rows:
         name = row.get("name")
-        changed_at = row.get("changedAt")
-        if name:
-            key = (name.lower(), changed_at)
-            if key not in unique_entries:
-                unique_entries[key] = (name, changed_at)
-    return list(unique_entries.values())
+        if not name: continue
+        name_lower = name.lower()
+        
+        # Prioritize entry with a timestamp
+        if name_lower not in name_map or (name_map[name_lower][1] is None and row.get("changedAt") is not None):
+            name_map[name_lower] = (name, row.get("changedAt"))
+            
+    return list(name_map.values())
 
-# --- DATABASE SETUP & MODELS ---
+# --- DATABASE ---
 Base = declarative_base()
-
 class Profile(Base):
     __tablename__ = "profiles"
     uuid = Column(String(36), primary_key=True)
-    query = Column(String(32))
-    last_seen_at = Column(DateTime)
+    query = Column(String(32)); last_seen_at = Column(DateTime)
     history = relationship("History", back_populates="profile", cascade="all, delete-orphan")
     source_updates = relationship("SourceUpdate", back_populates="profile", cascade="all, delete-orphan")
 
@@ -255,8 +210,7 @@ class History(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     uuid = Column(String(36), ForeignKey("profiles.uuid", ondelete="CASCADE"), nullable=False, index=True)
     name = Column(String(32), nullable=False, index=True)
-    changed_at = Column(String(32), index=True)
-    observed_at = Column(DateTime, nullable=False)
+    changed_at = Column(String(32), index=True); observed_at = Column(DateTime, nullable=False)
     profile = relationship("Profile", back_populates="history")
     __table_args__ = (UniqueConstraint("uuid", "name", "changed_at"),)
 
@@ -267,26 +221,18 @@ class SourceUpdate(Base):
     last_updated_at = Column(DateTime, nullable=False, index=True)
     profile = relationship("Profile", back_populates="source_updates")
 
-if DB_TYPE == "sqlite":
-    db_url = f"sqlite:///{DB_PATH}"
-else:
-    db_url = DB_URL
+db_url = f"sqlite:///{DB_PATH}" if DB_TYPE == "sqlite" else DB_URL
 engine = create_engine(db_url, echo=False, future=True)
 SessionLocal = scoped_session(sessionmaker(bind=engine, autoflush=False, autocommit=False))
 
-def init_db():
-    Base.metadata.create_all(bind=engine)
+def init_db(): Base.metadata.create_all(bind=engine)
 
 @contextmanager
 def tx():
     session = SessionLocal()
-    try:
-        yield session
-        session.commit()
-    except Exception:
-        session.rollback(); raise
-    finally:
-        session.close()
+    try: yield session; session.commit()
+    except: session.rollback(); raise
+    finally: session.close()
 
 # --- CORE LOGIC ---
 def ensure_profile(session, uuid: str, query: Optional[str]):
@@ -317,67 +263,38 @@ def insert_or_merge_history(session, uuid: str, name: str, changed_at: Optional[
 
 def query_history_public(session, uuid: str) -> Dict[str, Any]:
     profile = session.get(Profile, uuid)
-    if not profile:
-        return {"query": None, "uuid": uuid, "last_seen_at": None, "history": []}
-
+    if not profile: return {"query": None, "uuid": uuid, "last_seen_at": None, "history": []}
     rows = session.query(History).filter_by(uuid=uuid).all()
+    rows.sort(key=lambda r: r.changed_at or "0")
     
-    # Sort entries by timestamp. Treat null as the oldest.
-    def sort_key(row):
-        return row.changed_at or "0000-01-01T00:00:00Z"
-    rows.sort(key=sort_key)
-    
-    # Deduplicate consecutive names from the chronologically sorted list
-    final_rows = []
-    last_name = None
+    final_rows, last_name = [], None
     for row in rows:
-        if row.name != last_name:
+        if row.name.lower() != (last_name or "").lower():
             final_rows.append(row)
             last_name = row.name
-
-    history_items = []
-    for i, r in enumerate(final_rows):
-        history_items.append({
-            "id": i + 1,
-            "name": r.name,
-            "changed_at": r.changed_at,
-            "observed_at": r.observed_at.isoformat(),
-            "censored": r.name in {"-", "—", "–", "‑"} or r.name == "",
-        })
-        
-    return {
-        "query": profile.query,
-        "uuid": profile.uuid,
-        "last_seen_at": profile.last_seen_at.isoformat(),
-        "history": history_items,
-    }
+    
+    history = [{"id": i+1, "name": r.name, "changed_at": r.changed_at, "observed_at": r.observed_at.isoformat(), "censored": r.name in {"-"}} for i, r in enumerate(final_rows)]
+    return {"query": profile.query, "uuid": profile.uuid, "last_seen_at": profile.last_seen_at.isoformat(), "history": history}
 
 def _update_profile_from_sources(uuid: str, current_name: str) -> Dict[str, Any]:
     log.info("Updating profile from sources", extra={"uuid": uuid, "current_name": current_name})
     rows = gather_remote_rows_by_uuid(uuid)
     pairs = merge_remote_sources(rows)
-
     with tx() as con:
         ensure_profile(con, uuid, current_name)
         for name, changed_at in pairs:
             insert_or_merge_history(con, uuid, name, changed_at)
-        
-        # Ensure the current name is in the DB if it's not already there from sources
-        if not any(p[0].lower() == current_name.lower() for p in pairs):
-            insert_or_merge_history(con, uuid, current_name, None)
-
         update_source_timestamp(con, uuid, "scraper")
         return query_history_public(con, uuid)
 
 def delete_profile(session, uuid: str) -> bool:
     profile = session.get(Profile, uuid)
-    if profile:
-        session.delete(profile)
-        return True
+    if profile: session.delete(profile); return True
     return False
 
 # --- FLASK API ---
 app = Flask(__name__)
+RATE_BUCKET, RATE_LOCK = {}, threading.Lock()
 
 @app.errorhandler(HTTPException)
 def handle_exception(e: HTTPException):
@@ -386,8 +303,6 @@ def handle_exception(e: HTTPException):
     response.content_type = "application/json"
     return response
 
-RATE_BUCKET: Dict[str, List[float]] = {}
-RATE_LOCK = threading.Lock()
 @app.before_request
 def _apply_rate_limit():
     ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
@@ -395,79 +310,86 @@ def _apply_rate_limit():
     with RATE_LOCK:
         bucket = RATE_BUCKET.setdefault(ip, [])
         bucket[:] = [t for t in bucket if now - t <= RATE_LIMIT_WINDOW]
-        if len(bucket) >= RATE_LIMIT_RPM:
-            log.warning("Rate limit exceeded", extra={"ip": ip, "path": request.path})
-            abort(429)
+        if len(bucket) >= RATE_LIMIT_RPM: abort(429)
         bucket.append(now)
 
 @app.route("/api/namehistory", methods=["GET"])
-def api_namehistory_by_username():
+def api_namehistory():
     username = request.args.get("username", "").strip()
-    if not re.fullmatch(r"[A-Za-z0-9_]{1,16}", username):
-        abort(400, "username query parameter required (1–16 chars)")
-
-    normalized = normalize_username(username)
-    uuid_to_query = None
-    current_name = None
-
-    if normalized:
-        current_name, uuid_to_query = normalized
-    else:
-        with tx() as con:
-            uuid_to_query = get_uuid_from_history_by_name(con, username)
-            if uuid_to_query:
-                current_name = get_profile_by_uuid_from_mojang(uuid_to_query)
-
-    if not uuid_to_query or not current_name:
-        abort(404, "Username not found")
-
-    with tx() as con:
-        if not is_source_stale(con, uuid_to_query, "scraper", SCRAPER_STALE_HOURS):
-            return jsonify(query_history_public(con, uuid_to_query))
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,16}", username): abort(400, "username required")
     
-    return jsonify(_update_profile_from_sources(uuid_to_query, current_name))
+    normalized = normalize_username(username)
+    uuid, current_name = (None, None)
+    if normalized: current_name, uuid = normalized
+    else:
+        with tx() as s: uuid = get_uuid_from_history_by_name(s, username)
+        if uuid: current_name = get_profile_by_uuid_from_mojang(uuid)
+
+    if not uuid or not current_name: abort(404, "Username not found")
+    with tx() as s:
+        if not is_source_stale(s, uuid, "scraper", SCRAPER_STALE_HOURS):
+            return jsonify(query_history_public(s, uuid))
+    return jsonify(_update_profile_from_sources(uuid, current_name))
 
 @app.route("/api/namehistory/uuid/<uuid>", methods=["GET"])
 def api_namehistory_by_uuid(uuid):
     uuid = dashed_uuid(uuid)
     current_name = get_profile_by_uuid_from_mojang(uuid)
-    if not current_name:
-        abort(404, "UUID not found")
-    with tx() as con:
-        if not is_source_stale(con, uuid, "scraper", SCRAPER_STALE_HOURS):
-            return jsonify(query_history_public(con, uuid))
+    if not current_name: abort(404, "UUID not found")
+    with tx() as s:
+        if not is_source_stale(s, uuid, "scraper", SCRAPER_STALE_HOURS):
+            return jsonify(query_history_public(s, uuid))
     return jsonify(_update_profile_from_sources(uuid, current_name))
 
 @app.route("/api/namehistory", methods=["DELETE"])
 def api_delete():
     username = request.args.get("username", "").strip()
     uuid_param = request.args.get("uuid", "").strip()
-    if not username and not uuid_param:
-        abort(400, "Either 'username' or 'uuid' parameter required")
+    if not username and not uuid_param: abort(400, "username or uuid required")
     
-    uuid = None
-    if uuid_param:
-        uuid = dashed_uuid(uuid_param)
-    elif username:
-        normalized = normalize_username(username)
-        if normalized: _, uuid = normalized
+    uuid = dashed_uuid(uuid_param) if uuid_param else None
+    if not uuid and username:
+        norm = normalize_username(username)
+        if norm: _, uuid = norm
         else:
             with tx() as s: uuid = get_uuid_from_history_by_name(s, username)
     
     if not uuid: abort(404, "Profile not found")
-
     with tx() as s:
         if not delete_profile(s, uuid): abort(404, "Profile not found in database")
+    return jsonify({"message": "Profile deleted", "uuid": uuid})
+
+@app.route("/api/namehistory/update", methods=["POST"])
+def api_update():
+    body = request.get_json(force=True, silent=False) or {}
+    results = {"updated": [], "errors": []}
     
-    log.info("Profile deleted", extra={"uuid": uuid})
-    return jsonify({"message": "Profile deleted successfully", "uuid": uuid})
-    
-# --- MAIN EXECUTION ---
+    usernames = body.get("usernames", [])
+    if "username" in body: usernames.append(body["username"])
+    uuids = body.get("uuids", [])
+    if "uuid" in body: uuids.append(body["uuid"])
+
+    for name in usernames:
+        norm = normalize_username(name)
+        if not norm: results["errors"].append({"username": name, "error": "Not found"})
+        else: results["updated"].append(_update_profile_from_sources(norm[1], norm[0]))
+        bulk_sleep()
+        
+    for u in uuids:
+        u = dashed_uuid(u)
+        name = get_profile_by_uuid_from_mojang(u)
+        if not name: results["errors"].append({"uuid": u, "error": "Not found"})
+        else: results["updated"].append(_update_profile_from_sources(u, name))
+        bulk_sleep()
+        
+    return jsonify(results)
+
+# --- MAIN ---
 if __name__ == "__main__":
     init_db()
     log.info("DB initialized")
     if AUTO_UPDATE_ENABLED:
-        # Placeholder for background worker thread if needed
+        # Auto-update worker can be started in a thread here if needed
         pass
     log.info(f"Starting Flask server on {HOST}:{PORT}")
     app.run(host=HOST, port=PORT)
