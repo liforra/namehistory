@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import (
     create_engine, Column, String, Integer, DateTime, ForeignKey, 
-    UniqueConstraint, Text, text
+    UniqueConstraint
 )
 from sqlalchemy.orm import (
     sessionmaker, declarative_base, relationship, scoped_session
@@ -190,7 +190,7 @@ def merge_remote_sources(rows: List[Dict[str, Optional[str]]]) -> List[Tuple[str
         if not name: continue
         name_lower = name.lower()
         
-        # Prioritize entry with a timestamp
+        # Prioritize entry with a timestamp over one without
         if name_lower not in name_map or (name_map[name_lower][1] is None and row.get("changedAt") is not None):
             name_map[name_lower] = (name, row.get("changedAt"))
             
@@ -257,19 +257,16 @@ def is_source_stale(session, uuid: str, source: str, stale_hours: int) -> bool:
     last_updated = su.last_updated_at.replace(tzinfo=timezone.utc) if su.last_updated_at.tzinfo is None else su.last_updated_at
     return (datetime.now(timezone.utc) - last_updated).total_seconds() > (stale_hours * 3600)
 
-def insert_or_merge_history(session, uuid: str, name: str, changed_at: Optional[str]):
-    if not session.query(History).filter_by(uuid=uuid, name=name, changed_at=changed_at).first():
-        session.add(History(uuid=uuid, name=name, changed_at=changed_at, observed_at=datetime.now(timezone.utc)))
-
 def query_history_public(session, uuid: str) -> Dict[str, Any]:
     profile = session.get(Profile, uuid)
     if not profile: return {"query": None, "uuid": uuid, "last_seen_at": None, "history": []}
+    
     rows = session.query(History).filter_by(uuid=uuid).all()
-    rows.sort(key=lambda r: r.changed_at or "0")
+    rows.sort(key=lambda r: r.changed_at or "0") # Sort chronologically, nulls first
     
     final_rows, last_name = [], None
     for row in rows:
-        if row.name.lower() != (last_name or "").lower():
+        if row.name.lower() != (last_name or "").lower(): # Prevent consecutive duplicates
             final_rows.append(row)
             last_name = row.name
     
@@ -278,12 +275,21 @@ def query_history_public(session, uuid: str) -> Dict[str, Any]:
 
 def _update_profile_from_sources(uuid: str, current_name: str) -> Dict[str, Any]:
     log.info("Updating profile from sources", extra={"uuid": uuid, "current_name": current_name})
+    
     rows = gather_remote_rows_by_uuid(uuid)
+    # Add current name to the list to ensure it's considered in the merge
+    rows.append({"name": current_name, "changedAt": None})
+    
     pairs = merge_remote_sources(rows)
+
     with tx() as con:
+        # Clean slate: Delete old history to prevent conflicts
+        con.query(History).filter_by(uuid=uuid).delete()
+        
         ensure_profile(con, uuid, current_name)
         for name, changed_at in pairs:
-            insert_or_merge_history(con, uuid, name, changed_at)
+            con.add(History(uuid=uuid, name=name, changed_at=changed_at, observed_at=datetime.now(timezone.utc)))
+        
         update_source_timestamp(con, uuid, "scraper")
         return query_history_public(con, uuid)
 
@@ -372,15 +378,17 @@ def api_update():
     for name in usernames:
         norm = normalize_username(name)
         if not norm: results["errors"].append({"username": name, "error": "Not found"})
-        else: results["updated"].append(_update_profile_from_sources(norm[1], norm[0]))
-        bulk_sleep()
+        else: 
+            results["updated"].append(_update_profile_from_sources(norm[1], norm[0]))
+            bulk_sleep()
         
     for u in uuids:
         u = dashed_uuid(u)
         name = get_profile_by_uuid_from_mojang(u)
         if not name: results["errors"].append({"uuid": u, "error": "Not found"})
-        else: results["updated"].append(_update_profile_from_sources(u, name))
-        bulk_sleep()
+        else: 
+            results["updated"].append(_update_profile_from_sources(u, name))
+            bulk_sleep()
         
     return jsonify(results)
 
@@ -389,7 +397,7 @@ if __name__ == "__main__":
     init_db()
     log.info("DB initialized")
     if AUTO_UPDATE_ENABLED:
-        # Auto-update worker can be started in a thread here if needed
+        # Auto-update worker can be started in a separate thread here if desired
         pass
     log.info(f"Starting Flask server on {HOST}:{PORT}")
     app.run(host=HOST, port=PORT)
