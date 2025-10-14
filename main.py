@@ -365,6 +365,50 @@ def parse_iso(dt: Optional[str]) -> Optional[datetime]:
 
 
 
+def _update_profile_from_sources(uuid: str, current_name: str) -> Dict[str, Any]:
+    """
+    Wrapper for update_profile_from_sources for legacy compatibility.
+    """
+    # The actual implementation is below, but this ensures the function is defined for all usages.
+    # Move the real implementation here if needed.
+    # (This is the authoritative function to fetch, merge, and save a profile's history.)
+    if not uuid:
+        log.error(f"Invalid UUID provided for {current_name}")
+        return {"query": current_name, "uuid": None, "last_seen_at": None, "history": []}
+
+    log.info(
+        "Updating profile from sources",
+        extra={"uuid": uuid, "current_name": current_name},
+    )
+
+    rows = gather_remote_rows_by_uuid(uuid)
+
+    if not rows:
+        log.warning(
+            "No historical data found from any source for profile", extra={"uuid": uuid}
+        )
+
+    pairs = merge_remote_sources(rows)
+
+    with tx() as con:
+        # Update the main profile entry with the latest known current name
+        ensure_profile(con, uuid, current_name)
+
+        # Insert all historical names
+        for n, t in pairs:
+            if n is None:
+                continue
+            insert_or_merge_history(con, uuid, n, t, "profiles", t)
+
+        # Ensure the current name is correctly marked as the last entry
+        ensure_current_entry(con, uuid, current_name)
+
+        # Update source timestamps
+        update_source_timestamp(con, uuid, "mojang")
+        update_source_timestamp(con, uuid, "scraper")
+
+        return query_history_public(con, uuid)
+
 # --- SQLAlchemy Setup ---
 Base = declarative_base()
 
