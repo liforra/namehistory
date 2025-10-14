@@ -358,50 +358,42 @@ def merge_remote_sources(
 ) -> List[Tuple[str, Optional[str]]]:
     """
     Intelligently merge entries from multiple sources.
-    Allow non-consecutive duplicate names, but not consecutive duplicates.
-    Prefer entries with timestamps, deduplicate by (name, changed_at).
+    Preserve chronological order, with original name (null timestamp) first.
     """
-    # Collect all entries, preserving order: undated first, then by timestamp
-    all_entries = []
+    # Separate entries with and without timestamps
+    original_entries = []  # null changed_at (original name)
+    dated_entries = []  # has changed_at timestamp
+    
     seen = set()
     
-    # First, collect undated entries (changedAt is None)
     for row in rows:
         name = row.get("name")
         changed_at = row.get("changedAt")
         if not name:
             continue
-        if changed_at is None:
-            key = (name, changed_at)
-            if key not in seen:
-                all_entries.append((name, changed_at))
-                seen.add(key)
-    
-    # Then, collect dated entries, sorted by timestamp
-    dated = [
-        (row.get("name"), row.get("changedAt"))
-        for row in rows
-        if row.get("name") and row.get("changedAt") is not None
-    ]
-    
-    # Remove duplicates by (name, changed_at)
-    dated = list({(n, t): (n, t) for n, t in dated}.values())
-    
-    # Sort by changed_at (ISO string)
-    dated.sort(key=lambda x: x[1])
-    
-    for entry in dated:
-        if entry not in all_entries:
-            all_entries.append(entry)
-    
-    # Now, remove consecutive duplicates (same name as previous)
-    result = []
-    last_name = None
-    for name, changed_at in all_entries:
-        if name == last_name:
+        
+        key = (name.lower(), changed_at)
+        if key in seen:
             continue
-        result.append((name, changed_at))
-        last_name = name
+        seen.add(key)
+        
+        if changed_at is None:
+            original_entries.append((name, changed_at))
+        else:
+            dated_entries.append((name, changed_at))
+    
+    # Sort dated entries chronologically
+    dated_entries.sort(key=lambda x: x[1] or "")
+    
+    # Build result: original first (if exists), then all dated entries in order
+    result = []
+    
+    # Add original name first (the one with null timestamp)
+    if original_entries:
+        result.append(original_entries[0])
+    
+    # Add all dated entries in chronological order
+    result.extend(dated_entries)
     
     return result
 
@@ -578,11 +570,15 @@ def insert_or_merge_history(session, uuid: str, name: str, changed_at: Optional[
 
 
 def ensure_current_entry(session, uuid: str, current_name: str) -> None:
-    # Check if an undated entry for the current name already exists.
-    exists = session.query(History).filter_by(uuid=uuid, name=current_name, changed_at=None).first()
-    if exists:
+    """Ensure current name exists in history, but don't duplicate it"""
+    # Check if this name already exists in the history (with or without timestamp)
+    existing_any = session.query(History).filter_by(uuid=uuid, name=current_name).first()
+    if existing_any:
+        # Name already exists in history, don't add a duplicate
         return
-    log.info("Adding missing 'Current' entry", extra={"uuid": uuid, "username": current_name})
+    
+    # Only add if the name doesn't exist at all
+    log.info("Adding current name to history", extra={"uuid": uuid, "username": current_name})
     insert_or_merge_history(session, uuid, current_name, None, "current", None)
 
 
@@ -592,59 +588,56 @@ def query_history_public(session, uuid: str) -> Dict[str, Any]:
         return {"query": None, "uuid": uuid, "last_seen_at": None, "history": []}
 
     rows = session.query(History).filter_by(uuid=uuid).all()
+    
+    # Separate entries into original (null changed_at) and dated
+    original = None
     dated = []
-    undated = []
+    
     for r in rows:
-        # Ensure datetime is timezone-aware
         observed_at = r.observed_at
         if observed_at and observed_at.tzinfo is None:
             observed_at = observed_at.replace(tzinfo=timezone.utc)
-            
-        d = {
+        
+        entry = {
             "name": r.name,
             "changed_at": r.changed_at,
             "observed_at": observed_at.isoformat() if observed_at else None,
         }
-        if r.changed_at is not None:
-            dated.append(d)
+        
+        if r.changed_at is None:
+            # This is the original name
+            if original is None or (observed_at and parse_iso(original["observed_at"]) and 
+                                   observed_at < parse_iso(original["observed_at"])):
+                original = entry
         else:
-            undated.append(d)
+            dated.append(entry)
     
-    # Sort by ISO format string instead of datetime objects
+    # Sort dated entries chronologically
     dated.sort(key=lambda x: x["changed_at"] or "")
-    undated.sort(key=lambda x: x["observed_at"] or "")
-    original_name_entry = undated[0] if undated else None
-    current_name_entry = undated[-1] if undated else None
+    
+    # Build final list: original first, then dated entries
     final_list = []
-    if original_name_entry:
-        final_list.append(original_name_entry)
-    for entry in dated:
-        if not original_name_entry or (entry["name"] != original_name_entry["name"]):
-            final_list.append(entry)
-    if current_name_entry:
-        is_original = (
-            original_name_entry
-            and current_name_entry["observed_at"] == original_name_entry["observed_at"]
-        )
-        is_last_dated = dated and current_name_entry["name"] == dated[-1]["name"]
-        if not is_original and not is_last_dated:
-            final_list.append(current_name_entry)
-    seen = set()
-    deduplicated_list = []
-    for item in final_list:
-        key = (item["name"], item["changed_at"])
-        if key not in seen:
-            seen.add(key)
-            deduplicated_list.append(item)
+    if original:
+        final_list.append(original)
+    final_list.extend(dated)
+    
+    # Deduplicate and add metadata
     items = []
-    for idx, r in enumerate(deduplicated_list):
+    seen_names = set()
+    for idx, entry in enumerate(final_list):
+        # Skip consecutive duplicates
+        if entry["name"] in seen_names:
+            continue
+        seen_names.add(entry["name"])
+        
         items.append({
             "id": idx + 1,
-            "name": r["name"],
-            "changed_at": r["changed_at"],
-            "observed_at": r["observed_at"],
-            "censored": is_censored(r["name"]),
+            "name": entry["name"],
+            "changed_at": entry["changed_at"],
+            "observed_at": entry["observed_at"],
+            "censored": is_censored(entry["name"]),
         })
+    
     return {
         "query": p.query,
         "uuid": p.uuid,
@@ -685,7 +678,7 @@ def _update_profile_from_sources(uuid: str, current_name: str) -> Dict[str, Any]
                 continue
             insert_or_merge_history(con, uuid, n, t, "profiles", t)
 
-        # Ensure the current name is correctly marked as the last entry
+        # Ensure the current name exists (but don't duplicate)
         ensure_current_entry(con, uuid, current_name)
 
         # Update source timestamps
@@ -693,6 +686,15 @@ def _update_profile_from_sources(uuid: str, current_name: str) -> Dict[str, Any]
         update_source_timestamp(con, uuid, "scraper")
 
         return query_history_public(con, uuid)
+
+
+def delete_profile(session, uuid: str) -> bool:
+    """Delete a profile and all associated data"""
+    profile = session.get(Profile, uuid)
+    if not profile:
+        return False
+    session.delete(profile)
+    return True
 
 
 def clean_database():
@@ -1021,6 +1023,41 @@ def api_update():
             raise e
         log.error("API error in update", exc_info=True)
         abort(500)
+
+
+@app.delete("/api/namehistory")
+def api_delete():
+    """Delete a profile by username or UUID"""
+    username = request.args.get("username", "").strip()
+    uuid_param = request.args.get("uuid", "").strip()
+    
+    if not username and not uuid_param:
+        abort(400, "Either 'username' or 'uuid' parameter required")
+    
+    uuid = None
+    
+    if uuid_param:
+        uuid = dashed_uuid(uuid_param)
+    elif username:
+        # Look up UUID from username
+        normalized = normalize_username(username)
+        if normalized:
+            _, uuid = normalized
+        else:
+            # Try to find in history
+            with tx() as session:
+                uuid = get_uuid_from_history_by_name(session, username)
+    
+    if not uuid:
+        abort(404, "Profile not found")
+    
+    with tx() as session:
+        deleted = delete_profile(session, uuid)
+        if not deleted:
+            abort(404, "Profile not found in database")
+    
+    log.info("Profile deleted", extra={"uuid": uuid})
+    return jsonify({"message": "Profile deleted successfully", "uuid": uuid})
 
 
 @app.post("/api/namehistory/refresh-all")
