@@ -513,17 +513,24 @@ def query_history_public(session, uuid: str) -> Dict[str, Any]:
     dated = []
     undated = []
     for r in rows:
+        # Ensure datetime is timezone-aware
+        observed_at = r.observed_at
+        if observed_at and observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=timezone.utc)
+            
         d = {
             "name": r.name,
             "changed_at": r.changed_at,
-            "observed_at": r.observed_at,
+            "observed_at": observed_at.isoformat() if observed_at else None,
         }
         if r.changed_at is not None:
             dated.append(d)
         else:
             undated.append(d)
-    dated.sort(key=lambda x: x["changed_at"])
-    undated.sort(key=lambda x: x["observed_at"])
+    
+    # Sort by ISO format string instead of datetime objects
+    dated.sort(key=lambda x: x["changed_at"] or "")
+    undated.sort(key=lambda x: x["observed_at"] or "")
     original_name_entry = undated[0] if undated else None
     current_name_entry = undated[-1] if undated else None
     final_list = []
@@ -1086,6 +1093,31 @@ def run_debugger(username: str):
         log.error(f"Failed to fetch Laby.net: {e}")
 
 
+def ensure_db():
+    """Ensure database exists and has the correct schema"""
+    if DB_TYPE == "postgresql":
+        # For PostgreSQL, we need to make sure the database exists
+        admin_url = db_url.rsplit('/', 1)[0] + '/postgres'
+        admin_engine = create_engine(admin_url)
+        conn = admin_engine.connect()
+        conn.execute("commit")
+        
+        try:
+            db_name = db_url.rsplit('/', 1)[1]
+            result = conn.execute(f"SELECT 1 FROM pg_database WHERE datname = '{db_name}'")
+            if not result.fetchone():
+                conn.execute(f"CREATE DATABASE {db_name}")
+                log.info(f"Created database {db_name}")
+        except Exception as e:
+            log.warning(f"Could not create database: {e}")
+        finally:
+            conn.close()
+            admin_engine.dispose()
+    
+    # Create tables
+    Base.metadata.create_all(bind=engine)
+    log.info("Database schema initialized")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Minecraft Name History API")
     parser.add_argument(
@@ -1101,10 +1133,10 @@ if __name__ == "__main__":
     if args.dump_html:
         run_debugger(args.dump_html)
     elif args.command == "clean":
-        init_db()
+        ensure_db()
         clean_database()
     else:
-        init_db()
+        ensure_db()
         log.info("DB initialized")
 
         if AUTO_UPDATE_ENABLED:
