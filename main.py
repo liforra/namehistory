@@ -184,17 +184,13 @@ def gather_remote_rows_by_uuid(uuid: str) -> List[Dict[str, Optional[str]]]:
     return rows
 
 def merge_remote_sources(rows: List[Dict[str, Optional[str]]]) -> List[Tuple[str, Optional[str]]]:
-    name_map: Dict[str, Tuple[str, Optional[str]]] = {}
+    # De-duplicates based on (name, changedAt) tuple, preserving name reuses
+    unique_entries = set()
     for row in rows:
         name = row.get("name")
-        if not name: continue
-        name_lower = name.lower()
-        
-        # Prioritize entry with a timestamp over one without
-        if name_lower not in name_map or (name_map[name_lower][1] is None and row.get("changedAt") is not None):
-            name_map[name_lower] = (name, row.get("changedAt"))
-            
-    return list(name_map.values())
+        if name:
+            unique_entries.add((name, row.get("changedAt")))
+    return list(unique_entries)
 
 # --- DATABASE ---
 Base = declarative_base()
@@ -264,26 +260,19 @@ def query_history_public(session, uuid: str) -> Dict[str, Any]:
     rows = session.query(History).filter_by(uuid=uuid).all()
     rows.sort(key=lambda r: r.changed_at or "0") # Sort chronologically, nulls first
     
-    final_rows, last_name = [], None
-    for row in rows:
-        if row.name.lower() != (last_name or "").lower(): # Prevent consecutive duplicates
-            final_rows.append(row)
-            last_name = row.name
-    
-    history = [{"id": i+1, "name": r.name, "changed_at": r.changed_at, "observed_at": r.observed_at.isoformat(), "censored": r.name in {"-"}} for i, r in enumerate(final_rows)]
+    history = [{"id": i+1, "name": r.name, "changed_at": r.changed_at, "observed_at": r.observed_at.isoformat(), "censored": r.name in {"-"}} for i, r in enumerate(rows)]
     return {"query": profile.query, "uuid": profile.uuid, "last_seen_at": profile.last_seen_at.isoformat(), "history": history}
 
 def _update_profile_from_sources(uuid: str, current_name: str) -> Dict[str, Any]:
     log.info("Updating profile from sources", extra={"uuid": uuid, "current_name": current_name})
     
     rows = gather_remote_rows_by_uuid(uuid)
-    # Add current name to the list to ensure it's considered in the merge
     rows.append({"name": current_name, "changedAt": None})
     
     pairs = merge_remote_sources(rows)
 
     with tx() as con:
-        # Clean slate: Delete old history to prevent conflicts
+        # Clean slate: Delete old history to ensure data is fresh and correct
         con.query(History).filter_by(uuid=uuid).delete()
         
         ensure_profile(con, uuid, current_name)
