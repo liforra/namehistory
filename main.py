@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import (
     create_engine, Column, String, Integer, DateTime, ForeignKey, 
-    UniqueConstraint, Index, Text, select, update, insert
+    UniqueConstraint, Index, Text, select, update, insert, text
 )
 from sqlalchemy.orm import (
     sessionmaker, declarative_base, relationship, scoped_session, 
@@ -1099,19 +1099,23 @@ def ensure_db():
         # For PostgreSQL, we need to make sure the database exists
         admin_url = db_url.rsplit('/', 1)[0] + '/postgres'
         admin_engine = create_engine(admin_url)
-        conn = admin_engine.connect()
-        conn.execute("commit")
         
         try:
-            db_name = db_url.rsplit('/', 1)[1]
-            result = conn.execute(f"SELECT 1 FROM pg_database WHERE datname = '{db_name}'")
-            if not result.fetchone():
-                conn.execute(f"CREATE DATABASE {db_name}")
-                log.info(f"Created database {db_name}")
+            with admin_engine.begin() as conn:
+                db_name = db_url.rsplit('/', 1)[1]
+                # Check if database exists
+                result = conn.execute(text(
+                    "SELECT 1 FROM pg_database WHERE datname = :db_name"
+                ), {"db_name": db_name})
+                
+                if not result.fetchone():
+                    # Need to commit current transaction before creating database
+                    conn.execute(text("COMMIT"))
+                    conn.execute(text(f"CREATE DATABASE {db_name}"))
+                    log.info(f"Created database {db_name}")
         except Exception as e:
             log.warning(f"Could not create database: {e}")
         finally:
-            conn.close()
             admin_engine.dispose()
     
     # Create tables
