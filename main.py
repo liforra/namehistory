@@ -11,6 +11,7 @@ import argparse
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from collections import defaultdict
 
 from sqlalchemy import (
     create_engine, Column, String, Integer, DateTime, ForeignKey, 
@@ -154,16 +155,43 @@ def fetch_namemc_data(username: str) -> List[Dict[str, Optional[str]]]:
     html = fetch_profile_html(f"https://namemc.com/profile/{username}")
     if not html: return []
     soup = BeautifulSoup(html, "html.parser")
-    table = soup.select_one('table.table-striped')
+    
+    # Updated selector - try both old and new table formats
+    table = soup.select_one('table.table-borderless') or soup.select_one('table.table-striped')
     if not table: return []
+    
+    tbody = table.find("tbody")
+    if not tbody: return []
+    
     out = []
-    for row in table.find("tbody").find_all("tr"):
+    for row in tbody.find_all("tr"):
+        # Skip mobile-only duplicate rows
+        if 'd-lg-none' in row.get('class', []):
+            continue
+            
         cells = row.find_all("td")
-        if len(cells) > 0:
-            name = cells[0].get_text(strip=True)
-            time_tag = cells[1].find("time") if len(cells) > 1 else None
-            changed_at = time_tag["datetime"].strip() if time_tag else None
-            out.append({"name": name, "changedAt": changed_at})
+        if len(cells) < 2:
+            continue
+            
+        # Find name cell - look for <a> with /search?q= link
+        name = None
+        for cell in cells:
+            link = cell.find("a", href=re.compile(r"/search\?q="))
+            if link:
+                name = link.get_text(strip=True)
+                break
+        
+        # Find time cell
+        changed_at = None
+        for cell in cells:
+            time_tag = cell.find("time")
+            if time_tag and time_tag.get("datetime"):
+                changed_at = time_tag["datetime"].strip()
+                break
+        
+        if name:
+            out.append({"name": name, "changedAt": changed_at, "source": "namemc"})
+    
     return out
 
 def fetch_laby_api_data(uuid: str) -> List[Dict[str, Optional[str]]]:
@@ -171,26 +199,116 @@ def fetch_laby_api_data(uuid: str) -> List[Dict[str, Optional[str]]]:
     try:
         r = scraper_session.get(url, headers={"Accept": "application/json"}, timeout=10)
         if r.status_code != 200: return []
-        return [{"name": e.get("name"), "changedAt": e.get("changed_at")} for e in r.json() if e.get("name")]
+        return [{"name": e.get("name"), "changedAt": e.get("changed_at"), "source": "laby"} for e in r.json() if e.get("name")]
     except Exception: return []
 
-def gather_remote_rows_by_uuid(uuid: str) -> List[Dict[str, Optional[str]]]:
-    rows = []
-    current_name = get_profile_by_uuid_from_mojang(uuid)
-    if current_name:
-        rows.extend(fetch_namemc_data(current_name))
-        jitter_sleep()
-    rows.extend(fetch_laby_api_data(uuid))
-    return rows
+def gather_remote_rows_by_uuid(uuid: str, current_name: str) -> List[Dict[str, Optional[str]]]:
+    """
+    Fetch from BOTH Laby and NameMC, return all results.
+    """
+    all_rows = []
+    
+    # Fetch from Laby API
+    log.debug(f"Fetching from Laby API for UUID {uuid}")
+    laby_rows = fetch_laby_api_data(uuid)
+    log.debug(f"Laby returned {len(laby_rows)} entries")
+    all_rows.extend(laby_rows)
+    jitter_sleep()
+    
+    # Fetch from NameMC
+    log.debug(f"Fetching from NameMC for username {current_name}")
+    namemc_rows = fetch_namemc_data(current_name)
+    log.debug(f"NameMC returned {len(namemc_rows)} entries")
+    all_rows.extend(namemc_rows)
+    
+    return all_rows
 
-def merge_remote_sources(rows: List[Dict[str, Optional[str]]]) -> List[Tuple[str, Optional[str]]]:
-    # De-duplicates based on (name, changedAt) tuple, preserving name reuses
-    unique_entries = set()
+def merge_remote_sources(rows: List[Dict[str, Optional[str]]], current_name: str) -> List[Tuple[str, Optional[str]]]:
+    """
+    Intelligently merge data from multiple sources.
+    
+    Rules:
+    1. Group entries by name (case-insensitive)
+    2. For each name, keep the EARLIEST non-null timestamp
+    3. If all timestamps are null, keep null
+    4. Preserve name reuses (same name appearing multiple times with different timestamps)
+    """
+    
+    # Group by (name_lower, timestamp) to detect exact duplicates
+    seen_exact = set()
+    unique_rows = []
+    
     for row in rows:
         name = row.get("name")
+        changed_at = row.get("changedAt")
         if name:
-            unique_entries.add((name, row.get("changedAt")))
-    return list(unique_entries)
+            key = (name.lower(), changed_at)
+            if key not in seen_exact:
+                seen_exact.add(key)
+                unique_rows.append(row)
+    
+    log.debug(f"After exact dedup: {len(unique_rows)} unique (name, timestamp) pairs")
+    
+    # Group by name to find conflicts
+    by_name = defaultdict(list)
+    for row in unique_rows:
+        name = row.get("name")
+        if name:
+            by_name[name.lower()].append(row)
+    
+    # For each name, resolve conflicts
+    result = []
+    for name_lower, entries in by_name.items():
+        # Get all timestamps for this name
+        timestamps = [e.get("changedAt") for e in entries]
+        
+        # Count how many times this name appears with different timestamps
+        unique_timestamps = set(timestamps)
+        
+        if len(unique_timestamps) == 1:
+            # No conflict - single timestamp for this name
+            result.append((entries[0].get("name"), timestamps[0]))
+            log.debug(f"Name '{entries[0].get('name')}': single timestamp {timestamps[0]}")
+        else:
+            # Multiple timestamps for same name - handle carefully
+            # Separate null from non-null timestamps
+            null_entries = [e for e in entries if e.get("changedAt") is None]
+            dated_entries = [e for e in entries if e.get("changedAt") is not None]
+            
+            if dated_entries:
+                # Sort by timestamp to get earliest
+                dated_entries.sort(key=lambda e: e.get("changedAt", ""))
+                earliest = dated_entries[0]
+                
+                # Check if there are multiple distinct timestamps
+                distinct_timestamps = set(e.get("changedAt") for e in dated_entries)
+                
+                if len(distinct_timestamps) > 1:
+                    # Name was reused! Keep all distinct occurrences
+                    log.debug(f"Name '{earliest.get('name')}': REUSED {len(distinct_timestamps)} times")
+                    for entry in dated_entries:
+                        result.append((entry.get("name"), entry.get("changedAt")))
+                else:
+                    # Just conflicting data for same change - keep earliest
+                    sources = [e.get("source") for e in entries]
+                    log.debug(f"Name '{earliest.get('name')}': earliest timestamp {earliest.get('changedAt')} from {sources}")
+                    result.append((earliest.get("name"), earliest.get("changedAt")))
+            else:
+                # Only null timestamps
+                result.append((null_entries[0].get("name"), None))
+                log.debug(f"Name '{null_entries[0].get('name')}': only null timestamp")
+    
+    # Ensure current name is in the list
+    current_name_lower = current_name.lower()
+    has_current = any(name.lower() == current_name_lower for name, _ in result)
+    
+    if not has_current:
+        log.debug(f"Adding current name '{current_name}' with null timestamp")
+        result.append((current_name, None))
+    
+    log.debug(f"Final merged result: {len(result)} name history entries")
+    
+    return result
 
 # --- DATABASE ---
 Base = declarative_base()
@@ -258,26 +376,46 @@ def query_history_public(session, uuid: str) -> Dict[str, Any]:
     if not profile: return {"query": None, "uuid": uuid, "last_seen_at": None, "history": []}
     
     rows = session.query(History).filter_by(uuid=uuid).all()
-    rows.sort(key=lambda r: r.changed_at or "0") # Sort chronologically, nulls first
     
-    history = [{"id": i+1, "name": r.name, "changed_at": r.changed_at, "observed_at": r.observed_at.isoformat(), "censored": r.name in {"-"}} for i, r in enumerate(rows)]
+    # Sort chronologically: None (original name) first, then by timestamp
+    def sort_key(r):
+        if r.changed_at is None:
+            return ""  # Empty string sorts before ISO dates
+        return r.changed_at
+    
+    rows.sort(key=sort_key)
+    
+    history = [
+        {
+            "id": i+1, 
+            "name": r.name, 
+            "changed_at": r.changed_at, 
+            "observed_at": r.observed_at.isoformat(), 
+            "censored": r.name in {"-"}
+        } 
+        for i, r in enumerate(rows)
+    ]
     return {"query": profile.query, "uuid": profile.uuid, "last_seen_at": profile.last_seen_at.isoformat(), "history": history}
 
 def _update_profile_from_sources(uuid: str, current_name: str) -> Dict[str, Any]:
-    log.info("Updating profile from sources", extra={"uuid": uuid, "current_name": current_name})
+    log.info(f"Updating profile from sources: uuid={uuid}, current_name={current_name}")
     
-    rows = gather_remote_rows_by_uuid(uuid)
-    rows.append({"name": current_name, "changedAt": None})
+    # Fetch from BOTH sources
+    rows = gather_remote_rows_by_uuid(uuid, current_name)
+    log.debug(f"Total fetched: {len(rows)} entries from all sources")
     
-    pairs = merge_remote_sources(rows)
+    # Intelligently merge the data
+    pairs = merge_remote_sources(rows, current_name)
+    log.info(f"Merged into {len(pairs)} final name history entries")
 
     with tx() as con:
         # Clean slate: Delete old history to ensure data is fresh and correct
         con.query(History).filter_by(uuid=uuid).delete()
         
         ensure_profile(con, uuid, current_name)
+        now = datetime.now(timezone.utc)
         for name, changed_at in pairs:
-            con.add(History(uuid=uuid, name=name, changed_at=changed_at, observed_at=datetime.now(timezone.utc)))
+            con.add(History(uuid=uuid, name=name, changed_at=changed_at, observed_at=now))
         
         update_source_timestamp(con, uuid, "scraper")
         return query_history_public(con, uuid)
