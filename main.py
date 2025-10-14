@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
+from dateutil import parser as dateutil_parser
 
 from sqlalchemy import (
     create_engine, Column, String, Integer, DateTime, ForeignKey, 
@@ -130,6 +131,20 @@ def dashed_uuid(raw: str) -> str:
         return f"{s[0:8]}-{s[8:12]}-{s[12:16]}-{s[16:20]}-{s[20:32]}"
     return raw
 
+def parse_timestamp(ts: Optional[str]) -> Optional[datetime]:
+    """Parse a timestamp string to datetime object, return None if invalid or None."""
+    if not ts:
+        return None
+    try:
+        return dateutil_parser.isoparse(ts).replace(tzinfo=timezone.utc)
+    except:
+        return None
+
+def normalize_timestamp(ts: Optional[str]) -> Optional[str]:
+    """Normalize a timestamp to a consistent ISO format."""
+    dt = parse_timestamp(ts)
+    return dt.isoformat() if dt else None
+
 # --- DATA FETCHING ---
 def normalize_username(name: str) -> Optional[Tuple[str, str]]:
     try:
@@ -227,88 +242,78 @@ def merge_remote_sources(rows: List[Dict[str, Optional[str]]], current_name: str
     """
     Intelligently merge data from multiple sources.
     
-    Rules:
-    1. Group entries by name (case-insensitive)
-    2. For each name, keep the EARLIEST non-null timestamp
-    3. If all timestamps are null, keep null
-    4. Preserve name reuses (same name appearing multiple times with different timestamps)
+    Key insight: You can't change from "Liforra" to "Liforra". 
+    If the same name appears with multiple timestamps, they're all describing 
+    the SAME historical name change - keep the earliest.
+    
+    Name reuse only happens when there are OTHER names in between.
     """
     
-    # Group by (name_lower, timestamp) to detect exact duplicates
-    seen_exact = set()
-    unique_rows = []
-    
+    # Step 1: Normalize all timestamps and group by (name, normalized_timestamp)
+    normalized_entries = []
     for row in rows:
         name = row.get("name")
         changed_at = row.get("changedAt")
-        if name:
-            key = (name.lower(), changed_at)
-            if key not in seen_exact:
-                seen_exact.add(key)
-                unique_rows.append(row)
-    
-    log.debug(f"After exact dedup: {len(unique_rows)} unique (name, timestamp) pairs")
-    
-    # Group by name to find conflicts
-    by_name = defaultdict(list)
-    for row in unique_rows:
-        name = row.get("name")
-        if name:
-            by_name[name.lower()].append(row)
-    
-    # For each name, resolve conflicts
-    result = []
-    for name_lower, entries in by_name.items():
-        # Get all timestamps for this name
-        timestamps = [e.get("changedAt") for e in entries]
+        source = row.get("source", "unknown")
         
-        # Count how many times this name appears with different timestamps
-        unique_timestamps = set(timestamps)
+        if name:
+            # Parse to datetime, then back to consistent ISO format
+            normalized_ts = normalize_timestamp(changed_at)
+            normalized_entries.append({
+                "name": name,
+                "timestamp": normalized_ts,
+                "datetime": parse_timestamp(changed_at),
+                "source": source
+            })
+    
+    log.debug(f"Processing {len(normalized_entries)} entries from all sources")
+    
+    # Step 2: Sort all entries chronologically (None first, then by datetime)
+    normalized_entries.sort(key=lambda e: e["datetime"] or datetime.min.replace(tzinfo=timezone.utc))
+    
+    # Step 3: Build the merged sequence by removing consecutive duplicates
+    merged = []
+    for entry in normalized_entries:
+        name = entry["name"]
+        timestamp = entry["timestamp"]
+        source = entry["source"]
         
-        if len(unique_timestamps) == 1:
-            # No conflict - single timestamp for this name
-            result.append((entries[0].get("name"), timestamps[0]))
-            log.debug(f"Name '{entries[0].get('name')}': single timestamp {timestamps[0]}")
-        else:
-            # Multiple timestamps for same name - handle carefully
-            # Separate null from non-null timestamps
-            null_entries = [e for e in entries if e.get("changedAt") is None]
-            dated_entries = [e for e in entries if e.get("changedAt") is not None]
+        # Check if this is a duplicate of the previous entry
+        if merged:
+            last_name, last_timestamp = merged[-1]
             
-            if dated_entries:
-                # Sort by timestamp to get earliest
-                dated_entries.sort(key=lambda e: e.get("changedAt", ""))
-                earliest = dated_entries[0]
+            # Same name as previous entry
+            if name.lower() == last_name.lower():
+                # This is the same name change, just detected later
+                # Keep the earlier timestamp
+                last_dt = parse_timestamp(last_timestamp)
+                curr_dt = parse_timestamp(timestamp)
                 
-                # Check if there are multiple distinct timestamps
-                distinct_timestamps = set(e.get("changedAt") for e in dated_entries)
-                
-                if len(distinct_timestamps) > 1:
-                    # Name was reused! Keep all distinct occurrences
-                    log.debug(f"Name '{earliest.get('name')}': REUSED {len(distinct_timestamps)} times")
-                    for entry in dated_entries:
-                        result.append((entry.get("name"), entry.get("changedAt")))
+                if curr_dt and last_dt and curr_dt < last_dt:
+                    # Current timestamp is earlier - replace
+                    log.debug(f"  Replacing {last_name} timestamp {last_timestamp} with earlier {timestamp} (from {source})")
+                    merged[-1] = (name, timestamp)
                 else:
-                    # Just conflicting data for same change - keep earliest
-                    sources = [e.get("source") for e in entries]
-                    log.debug(f"Name '{earliest.get('name')}': earliest timestamp {earliest.get('changedAt')} from {sources}")
-                    result.append((earliest.get("name"), earliest.get("changedAt")))
-            else:
-                # Only null timestamps
-                result.append((null_entries[0].get("name"), None))
-                log.debug(f"Name '{null_entries[0].get('name')}': only null timestamp")
+                    log.debug(f"  Skipping duplicate {name} timestamp {timestamp} (from {source}) - already have {last_timestamp}")
+                continue
+        
+        # Not a duplicate - add it
+        log.debug(f"  Adding {name} at {timestamp} (from {source})")
+        merged.append((name, timestamp))
     
-    # Ensure current name is in the list
-    current_name_lower = current_name.lower()
-    has_current = any(name.lower() == current_name_lower for name, _ in result)
+    # Step 4: Ensure current name is in the list
+    if merged:
+        last_name, _ = merged[-1]
+        if last_name.lower() != current_name.lower():
+            log.debug(f"  Adding current name '{current_name}' (not in history)")
+            merged.append((current_name, None))
+    else:
+        log.debug(f"  Adding current name '{current_name}' (empty history)")
+        merged.append((current_name, None))
     
-    if not has_current:
-        log.debug(f"Adding current name '{current_name}' with null timestamp")
-        result.append((current_name, None))
+    log.info(f"Final merged result: {len(merged)} unique name changes")
     
-    log.debug(f"Final merged result: {len(result)} name history entries")
-    
-    return result
+    return merged
 
 # --- DATABASE ---
 Base = declarative_base()
@@ -404,7 +409,7 @@ def _update_profile_from_sources(uuid: str, current_name: str) -> Dict[str, Any]
     rows = gather_remote_rows_by_uuid(uuid, current_name)
     log.debug(f"Total fetched: {len(rows)} entries from all sources")
     
-    # Intelligently merge the data
+    # Intelligently merge the data with timestamp normalization
     pairs = merge_remote_sources(rows, current_name)
     log.info(f"Merged into {len(pairs)} final name history entries")
 
