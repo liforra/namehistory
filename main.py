@@ -688,6 +688,7 @@ def _update_profile_from_sources(uuid: str, current_name: str) -> Dict[str, Any]
         log.info(f"Inserted {inserted} new history rows (preserved existing).")
 
         update_source_timestamp(con, uuid, "scraper")
+        con.flush()  # Ensure changes are visible to the query
         return query_history_public(con, uuid)
 
 
