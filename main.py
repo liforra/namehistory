@@ -535,6 +535,35 @@ class SourceUpdate(Base):
     profile = relationship("Profile", back_populates="source_updates")
 
 
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ip_address = Column(String(45), nullable=False, index=True)  # Support IPv6
+    username = Column(String(32), nullable=True, index=True)
+    first_seen_at = Column(DateTime, nullable=False)
+    last_seen_at = Column(DateTime, nullable=False)
+    requests = relationship("Request", back_populates="user", cascade="all, delete-orphan")
+    __table_args__ = (UniqueConstraint("ip_address", "username"),)
+
+
+class Request(Base):
+    __tablename__ = "requests"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    requested_username = Column(String(32), nullable=False, index=True)
+    source = Column(String(50), nullable=True)
+    version = Column(String(20), nullable=True)
+    endpoint = Column(String(100), nullable=False)
+    timestamp = Column(DateTime, nullable=False, index=True)
+    response_status = Column(Integer, nullable=False)
+    user = relationship("User", back_populates="requests")
+
+
 db_url = f"sqlite:///{DB_PATH}" if DB_TYPE == "sqlite" else DB_URL
 engine = create_engine(db_url, echo=False, future=True)
 SessionLocal = scoped_session(
@@ -543,7 +572,31 @@ SessionLocal = scoped_session(
 
 
 def init_db():
+    """Initialize database with all tables, creating missing ones automatically."""
+    # Create all tables that don't exist yet
     Base.metadata.create_all(bind=engine)
+
+    # Check if we need to add the new logging tables to existing databases
+    with engine.connect() as conn:
+        # Check if the new tables exist
+        try:
+            result = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+            users_exists = result.fetchone() is not None
+        except Exception:
+            users_exists = False
+
+        try:
+            result = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='requests'")
+            requests_exists = result.fetchone() is not None
+        except Exception:
+            requests_exists = False
+
+    # If tables don't exist, they were just created above
+    # If they do exist, log that the database is up to date
+    if users_exists and requests_exists:
+        log.info("Database already contains logging tables (users, requests)")
+    else:
+        log.info("Database migration completed - added logging tables (users, requests)")
 
 
 @contextmanager
@@ -692,12 +745,70 @@ def _update_profile_from_sources(uuid: str, current_name: str) -> Dict[str, Any]
         return query_history_public(con, uuid)
 
 
-def delete_profile(session, uuid: str) -> bool:
-    profile = session.get(Profile, uuid)
-    if profile:
-        session.delete(profile)
-        return True
-    return False
+def get_or_create_user(session, ip_address: str, username: Optional[str] = None) -> User:
+    """Get existing user or create new one based on IP address and optional username."""
+    user = None
+
+    # Try to find by IP and username if username is provided
+    if username:
+        user = session.query(User).filter_by(ip_address=ip_address, username=username).first()
+
+    # If not found and we have a username, try just by IP (in case username changed)
+    if not user:
+        user = session.query(User).filter_by(ip_address=ip_address).first()
+
+    now = datetime.now(timezone.utc)
+
+    if not user:
+        # Create new user
+        user = User(
+            ip_address=ip_address,
+            username=username,
+            first_seen_at=now,
+            last_seen_at=now
+        )
+        session.add(user)
+        log.debug(f"Created new user: IP={ip_address}, username={username}")
+    else:
+        # Update last seen timestamp
+        user.last_seen_at = now
+        if username and not user.username:
+            # Update username if it wasn't set before
+            user.username = username
+        log.debug(f"Updated existing user: IP={ip_address}, username={username or user.username}")
+
+    return user
+
+
+def log_request(session, ip_address: str, username: Optional[str], requested_username: str,
+                source: Optional[str], version: Optional[str], endpoint: str, response_status: int):
+    """Log a request to the database."""
+    if not requested_username:
+        log.warning(f"Cannot log request with empty requested_username for IP {ip_address}")
+        return
+
+    try:
+        # Get or create user
+        user = get_or_create_user(session, ip_address, username)
+
+        # Create request log entry
+        request_log = Request(
+            user_id=user.id,
+            requested_username=requested_username,
+            source=source,
+            version=version,
+            endpoint=endpoint,
+            timestamp=datetime.now(timezone.utc),
+            response_status=response_status
+        )
+
+        session.add(request_log)
+        log.debug(f"Logged request: user_id={user.id}, requested_username={requested_username}, "
+                 f"source={source}, version={version}, endpoint={endpoint}, status={response_status}")
+
+    except Exception as e:
+        log.error(f"Failed to log request for IP {ip_address}: {e}")
+        # Don't raise the exception - logging shouldn't break the API
 
 
 # --- FLASK API ---
@@ -734,6 +845,10 @@ def _apply_rate_limit():
 @app.route("/api/namehistory", methods=["GET"])
 def api_namehistory():
     username = request.args.get("username", "").strip()
+    source = request.args.get("source")
+    version = request.args.get("version")
+    req_name = request.args.get("req_name")
+
     if not re.fullmatch(r"[A-Za-z0-9_]{1,16}", username):
         abort(400, "username required")
 
@@ -749,22 +864,65 @@ def api_namehistory():
 
     if not uuid or not current_name:
         abort(404, "Username not found")
+
+    response_data = None
     with tx() as s:
         if not is_source_stale(s, uuid, "scraper", SCRAPER_STALE_HOURS):
-            return jsonify(query_history_public(s, uuid))
-    return jsonify(_update_profile_from_sources(uuid, current_name))
+            response_data = query_history_public(s, uuid)
+        else:
+            response_data = _update_profile_from_sources(uuid, current_name)
+
+    # Log the request
+    ip_address = (
+        request.headers.get("X-Forwarded-For", request.remote_addr or "unknown")
+        .split(",")[0]
+        .strip()
+    )
+    requested_username = req_name or username  # Use req_name if provided, otherwise username
+
+    try:
+        with tx() as s:
+            log_request(s, ip_address, username, requested_username, source, version,
+                       request.endpoint or "/api/namehistory", 200)
+    except Exception as e:
+        log.error(f"Failed to log request: {e}")
+
+    return jsonify(response_data)
 
 
 @app.route("/api/namehistory/uuid/<uuid>", methods=["GET"])
 def api_namehistory_by_uuid(uuid):
     uuid = dashed_uuid(uuid)
+    source = request.args.get("source")
+    version = request.args.get("version")
+    req_name = request.args.get("req_name")
+
     current_name = get_profile_by_uuid_from_mojang(uuid)
     if not current_name:
         abort(404, "UUID not found")
+
+    response_data = None
     with tx() as s:
         if not is_source_stale(s, uuid, "scraper", SCRAPER_STALE_HOURS):
-            return jsonify(query_history_public(s, uuid))
-    return jsonify(_update_profile_from_sources(uuid, current_name))
+            response_data = query_history_public(s, uuid)
+        else:
+            response_data = _update_profile_from_sources(uuid, current_name)
+
+    # Log the request
+    ip_address = (
+        request.headers.get("X-Forwarded-For", request.remote_addr or "unknown")
+        .split(",")[0]
+        .strip()
+    )
+
+    try:
+        with tx() as s:
+            log_request(s, ip_address, None, req_name or current_name, source, version,
+                       request.endpoint or "/api/namehistory/uuid/<uuid>", 200)
+    except Exception as e:
+        log.error(f"Failed to log request: {e}")
+
+    return jsonify(response_data)
 
 
 @app.route("/api/namehistory", methods=["DELETE"])
@@ -772,6 +930,10 @@ def api_namehistory_by_uuid(uuid):
 def api_delete():
     username = request.args.get("username", "").strip()
     uuid_param = request.args.get("uuid", "").strip()
+    source = request.args.get("source")
+    version = request.args.get("version")
+    req_name = request.args.get("req_name")
+
     if not username and not uuid_param:
         abort(400, "username or uuid required")
 
@@ -786,16 +948,38 @@ def api_delete():
 
     if not uuid:
         abort(404, "Profile not found")
+
+    response_data = None
     with tx() as s:
         if not delete_profile(s, uuid):
             abort(404, "Profile not found in database")
-    return jsonify({"message": "Profile deleted", "uuid": uuid})
+        response_data = {"message": "Profile deleted", "uuid": uuid}
+
+    # Log the request
+    ip_address = (
+        request.headers.get("X-Forwarded-For", request.remote_addr or "unknown")
+        .split(",")[0]
+        .strip()
+    )
+
+    try:
+        with tx() as s:
+            log_request(s, ip_address, username, req_name or username or uuid, source, version,
+                       request.endpoint or "/api/namehistory", 200)
+    except Exception as e:
+        log.error(f"Failed to log request: {e}")
+
+    return jsonify(response_data)
 
 
 @app.route("/api/namehistory/update", methods=["POST"])
 @require_auth(AuthLevel.API)
 def api_update():
     body = request.get_json(force=True, silent=False) or {}
+    source = request.args.get("source")
+    version = request.args.get("version")
+    req_name = request.args.get("req_name")
+
     results = {"updated": [], "errors": []}
 
     usernames = body.get("usernames", [])
@@ -805,6 +989,7 @@ def api_update():
     if "uuid" in body:
         uuids.append(body["uuid"])
 
+    # Process usernames
     for name in usernames:
         norm = normalize_username(name)
         if not norm:
@@ -815,6 +1000,7 @@ def api_update():
             )
             bulk_sleep()
 
+    # Process UUIDs
     for u in uuids:
         u = dashed_uuid(u)
         name = get_profile_by_uuid_from_mojang(u)
@@ -823,6 +1009,22 @@ def api_update():
         else:
             results["updated"].append(_update_profile_from_sources(u, name))
             bulk_sleep()
+
+    # Log the request (we'll use the first requested username or a summary)
+    ip_address = (
+        request.headers.get("X-Forwarded-For", request.remote_addr or "unknown")
+        .split(",")[0]
+        .strip()
+    )
+
+    requested_username = req_name or (usernames[0] if usernames else (uuids[0] if uuids else "batch_update"))
+
+    try:
+        with tx() as s:
+            log_request(s, ip_address, None, requested_username, source, version,
+                       request.endpoint or "/api/namehistory/update", 200)
+    except Exception as e:
+        log.error(f"Failed to log request: {e}")
 
     return jsonify(results)
 
