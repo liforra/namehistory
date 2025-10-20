@@ -807,9 +807,11 @@ def log_request(session, ip_address: str, requester_username: Optional[str], req
         )
 
         session.add(request_log)
-        log.debug(f"Logged request: user_id={user.id}, requested_username={requested_username}, "
-                 f"source={source}, version={version}, mc_version={mc_version}, endpoint={endpoint}, "
-                 f"status={response_status}")
+        log.debug(
+            f"Logged request: user_id={user.id}, requester_username={requester_username}, "
+            f"requested_username={requested_username}, source={source}, version={version}, "
+            f"mc_version={mc_version}, endpoint={endpoint}, status={response_status}"
+        )
 
     except Exception as e:
         log.error(f"Failed to log request for IP {ip_address}: {e}")
@@ -889,8 +891,17 @@ def api_namehistory():
 
     try:
         with tx() as s:
-            log_request(s, ip_address, requester_username, requested_username, source, version,
-                       request.endpoint or "/api/namehistory", 200, mc_version)
+            log_request(
+                session=s,
+                ip_address=ip_address,
+                requester_username=requester_username,
+                requested_username=requested_username,
+                source=source,
+                version=version,
+                endpoint=request.endpoint or "/api/namehistory",
+                response_status=200,
+                mc_version=mc_version,
+            )
     except Exception as e:
         log.error(f"Failed to log request: {e}")
 
@@ -928,8 +939,17 @@ def api_namehistory_by_uuid(uuid):
 
     try:
         with tx() as s:
-            log_request(s, ip_address, requester_username, requested_username, source, version,
-                       request.endpoint or "/api/namehistory/uuid/<uuid>", 200, mc_version)
+            log_request(
+                session=s,
+                ip_address=ip_address,
+                requester_username=requester_username,
+                requested_username=requested_username,
+                source=source,
+                version=version,
+                endpoint=request.endpoint or "/api/namehistory/uuid/<uuid>",
+                response_status=200,
+                mc_version=mc_version,
+            )
     except Exception as e:
         log.error(f"Failed to log request: {e}")
 
@@ -979,8 +999,17 @@ def api_delete():
 
     try:
         with tx() as s:
-            log_request(s, ip_address, requester_username, requested_username, source, version,
-                       request.endpoint or "/api/namehistory", 200, mc_version)
+            log_request(
+                session=s,
+                ip_address=ip_address,
+                requester_username=requester_username,
+                requested_username=requested_username,
+                source=source,
+                version=version,
+                endpoint=request.endpoint or "/api/namehistory",
+                response_status=200,
+                mc_version=mc_version,
+            )
     except Exception as e:
         log.error(f"Failed to log request: {e}")
 
@@ -1038,8 +1067,17 @@ def api_update():
 
     try:
         with tx() as s:
-            log_request(s, ip_address, requester_username, requested_username, source, version,
-                       request.endpoint or "/api/namehistory/update", 200, mc_version)
+            log_request(
+                session=s,
+                ip_address=ip_address,
+                requester_username=requester_username,
+                requested_username=requested_username,
+                source=source,
+                version=version,
+                endpoint=request.endpoint or "/api/namehistory/update",
+                response_status=200,
+                mc_version=mc_version,
+            )
     except Exception as e:
         log.error(f"Failed to log request: {e}")
 
