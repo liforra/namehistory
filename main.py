@@ -768,6 +768,7 @@ def get_or_create_user(session, ip_address: str, username: Optional[str] = None)
             last_seen_at=now
         )
         session.add(user)
+        session.flush([user])
         log.debug(f"Created new user: IP={ip_address}, username={username}")
     else:
         # Update last seen timestamp
