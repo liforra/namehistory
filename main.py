@@ -558,6 +558,7 @@ class Request(Base):
     requested_username = Column(String(32), nullable=False, index=True)
     source = Column(String(50), nullable=True)
     version = Column(String(20), nullable=True)
+    mc_version = Column(String(20), nullable=True)
     endpoint = Column(String(100), nullable=False)
     timestamp = Column(DateTime, nullable=False, index=True)
     response_status = Column(Integer, nullable=False)
@@ -781,8 +782,9 @@ def get_or_create_user(session, ip_address: str, username: Optional[str] = None)
     return user
 
 
-def log_request(session, ip_address: str, username: Optional[str], requested_username: str,
-                source: Optional[str], version: Optional[str], endpoint: str, response_status: int):
+def log_request(session, ip_address: str, requester_username: Optional[str], requested_username: str,
+                source: Optional[str], version: Optional[str], endpoint: str, response_status: int,
+                mc_version: Optional[str] = None):
     """Log a request to the database."""
     if not requested_username:
         log.warning(f"Cannot log request with empty requested_username for IP {ip_address}")
@@ -790,7 +792,7 @@ def log_request(session, ip_address: str, username: Optional[str], requested_use
 
     try:
         # Get or create user
-        user = get_or_create_user(session, ip_address, username)
+        user = get_or_create_user(session, ip_address, requester_username)
 
         # Create request log entry
         request_log = Request(
@@ -798,6 +800,7 @@ def log_request(session, ip_address: str, username: Optional[str], requested_use
             requested_username=requested_username,
             source=source,
             version=version,
+            mc_version=mc_version,
             endpoint=endpoint,
             timestamp=datetime.now(timezone.utc),
             response_status=response_status
@@ -805,7 +808,8 @@ def log_request(session, ip_address: str, username: Optional[str], requested_use
 
         session.add(request_log)
         log.debug(f"Logged request: user_id={user.id}, requested_username={requested_username}, "
-                 f"source={source}, version={version}, endpoint={endpoint}, status={response_status}")
+                 f"source={source}, version={version}, mc_version={mc_version}, endpoint={endpoint}, "
+                 f"status={response_status}")
 
     except Exception as e:
         log.error(f"Failed to log request for IP {ip_address}: {e}")
@@ -849,6 +853,7 @@ def api_namehistory():
     source = request.args.get("source")
     version = request.args.get("version")
     req_name = request.args.get("req_name")
+    mc_version = request.args.get("mc_version")
 
     if not re.fullmatch(r"[A-Za-z0-9_]{1,16}", username):
         abort(400, "username required")
@@ -879,12 +884,13 @@ def api_namehistory():
         .split(",")[0]
         .strip()
     )
-    requested_username = req_name or username  # Use req_name if provided, otherwise username
+    requester_username = req_name.strip() if req_name and req_name.strip() else None
+    requested_username = username
 
     try:
         with tx() as s:
-            log_request(s, ip_address, username, requested_username, source, version,
-                       request.endpoint or "/api/namehistory", 200)
+            log_request(s, ip_address, requester_username, requested_username, source, version,
+                       request.endpoint or "/api/namehistory", 200, mc_version)
     except Exception as e:
         log.error(f"Failed to log request: {e}")
 
@@ -897,6 +903,7 @@ def api_namehistory_by_uuid(uuid):
     source = request.args.get("source")
     version = request.args.get("version")
     req_name = request.args.get("req_name")
+    mc_version = request.args.get("mc_version")
 
     current_name = get_profile_by_uuid_from_mojang(uuid)
     if not current_name:
@@ -916,10 +923,13 @@ def api_namehistory_by_uuid(uuid):
         .strip()
     )
 
+    requester_username = req_name.strip() if req_name and req_name.strip() else None
+    requested_username = current_name
+
     try:
         with tx() as s:
-            log_request(s, ip_address, None, req_name or current_name, source, version,
-                       request.endpoint or "/api/namehistory/uuid/<uuid>", 200)
+            log_request(s, ip_address, requester_username, requested_username, source, version,
+                       request.endpoint or "/api/namehistory/uuid/<uuid>", 200, mc_version)
     except Exception as e:
         log.error(f"Failed to log request: {e}")
 
@@ -934,6 +944,7 @@ def api_delete():
     source = request.args.get("source")
     version = request.args.get("version")
     req_name = request.args.get("req_name")
+    mc_version = request.args.get("mc_version")
 
     if not username and not uuid_param:
         abort(400, "username or uuid required")
@@ -963,10 +974,13 @@ def api_delete():
         .strip()
     )
 
+    requester_username = req_name.strip() if req_name and req_name.strip() else (username or None)
+    requested_username = username or uuid
+
     try:
         with tx() as s:
-            log_request(s, ip_address, username, req_name or username or uuid, source, version,
-                       request.endpoint or "/api/namehistory", 200)
+            log_request(s, ip_address, requester_username, requested_username, source, version,
+                       request.endpoint or "/api/namehistory", 200, mc_version)
     except Exception as e:
         log.error(f"Failed to log request: {e}")
 
@@ -980,6 +994,7 @@ def api_update():
     source = request.args.get("source")
     version = request.args.get("version")
     req_name = request.args.get("req_name")
+    mc_version = request.args.get("mc_version")
 
     results = {"updated": [], "errors": []}
 
@@ -1018,12 +1033,13 @@ def api_update():
         .strip()
     )
 
-    requested_username = req_name or (usernames[0] if usernames else (uuids[0] if uuids else "batch_update"))
+    requester_username = req_name.strip() if req_name and req_name.strip() else None
+    requested_username = usernames[0] if usernames else (uuids[0] if uuids else "batch_update")
 
     try:
         with tx() as s:
-            log_request(s, ip_address, None, requested_username, source, version,
-                       request.endpoint or "/api/namehistory/update", 200)
+            log_request(s, ip_address, requester_username, requested_username, source, version,
+                       request.endpoint or "/api/namehistory/update", 200, mc_version)
     except Exception as e:
         log.error(f"Failed to log request: {e}")
 
