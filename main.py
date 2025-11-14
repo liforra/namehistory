@@ -1128,15 +1128,21 @@ def get_docs_html(base_url):
         <title>Player History API Docs</title>
         <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
         <style>
+            .container {{
+                max-width: 90%;
+                margin: auto;
+            }}
             .button-group {{
                 display: flex;
                 gap: 0.5rem;
             }}
             .try-it-output {{
                 margin-top: 1rem;
-                background-color: #f0f0f0;
+                background-color: #1e1e1e;
                 padding: 1rem;
                 border-radius: 0.5rem;
+                color: #d4d4d4;
+                font-family: 'Courier New', Courier, monospace;
             }}
         </style>
     </head>
@@ -1157,15 +1163,14 @@ def get_docs_html(base_url):
                     <li><code>uuid</code> (query): The player's UUID.</li>
                 </ul>
                 <div class="button-group">
-                    <button onclick="tryIt('get', 'Notch')">Try It with username</button>
+                    <button onclick="tryIt('get')">Try It with username</button>
                     <button onclick="copyCurl('get', 'Notch')">Copy Curl Command (username)</button>
                 </div>
                 <div class="button-group" style="margin-top: 1rem;">
-                    <button onclick="tryIt('uuid', '069a79f4-44e9-4726-a5be-fca90e38aaf5')">Try It with UUID</button>
+                    <button onclick="tryIt('uuid')">Try It with UUID</button>
                     <button onclick="copyCurl('uuid', '069a79f4-44e9-4726-a5be-fca90e38aaf5')">Copy Curl Command (UUID)</button>
                 </div>
                 <pre id="get-output" class="try-it-output" style="display:none;"></pre>
-                <pre id="uuid-output" class="try-it-output" style="display:none;"></pre>
             </article>
 
             <article>
@@ -1198,26 +1203,31 @@ def get_docs_html(base_url):
                 return window.location.origin + '/';
             }}
 
-            function tryIt(type, param) {{
+            function tryIt(type) {{
                 const baseUrl = getBaseUrl();
                 let url = '';
+                let param = '';
                 if (type === 'get') {{
+                    param = prompt("Enter a username", "Notch");
+                    if (!param) return;
                     url = `${{baseUrl}}api/namehistory?username=${{param}}`;
                 }} else if (type === 'uuid') {{
+                    param = prompt("Enter a UUID", "069a79f4-44e9-4726-a5be-fca90e38aaf5");
+                    if (!param) return;
                     url = `${{baseUrl}}api/namehistory?uuid=${{param}}`;
                 }}
 
-                const output = document.getElementById(`${{type}}-output`);
+                const output = document.getElementById('get-output');
                 output.style.display = 'block';
-                output.textContent = 'Loading...';
+                output.textContent = `Fetching: ${{url}}\n\n`;
 
                 fetch(url)
                     .then(response => response.json())
                     .then(data => {{
-                        output.textContent = JSON.stringify(data, null, 2);
+                        output.textContent += JSON.stringify(data, null, 2);
                     }})
                     .catch(error => {{
-                        output.textContent = `Error: ${{error}}`;
+                        output.textContent += `Error: ${{error}}`;
                     }});
             }}
 
