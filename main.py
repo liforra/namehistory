@@ -697,6 +697,16 @@ def query_history_public(session, uuid: str) -> Dict[str, Any]:
     }
 
 
+def delete_profile(session, uuid: str) -> bool:
+    """Deletes a profile and its history by UUID."""
+    profile = session.get(Profile, uuid)
+    if profile:
+        session.delete(profile)
+        log.info(f"Deleted profile for UUID {uuid}")
+        return True
+    return False
+
+
 def _update_profile_from_sources(uuid: str, current_name: str) -> Dict[str, Any]:
     log.info(
         f"Updating profile from sources: uuid={uuid}, current_name={current_name}"
@@ -746,79 +756,97 @@ def _update_profile_from_sources(uuid: str, current_name: str) -> Dict[str, Any]
         return query_history_public(con, uuid)
 
 
-def get_or_create_user(session, ip_address: str, username: Optional[str] = None) -> User:
-    """Get existing user or create new one based on IP address and optional username."""
-    user = None
+@app.route("/api/namehistory", methods=["GET", "POST", "DELETE"])
+def api_namehistory():
+    if request.method == 'DELETE':
+        return api_delete()
+    
+    username = request.args.get("username", "").strip()
+    uuid_param = request.args.get("uuid", "").strip()
+    source = request.args.get("source")
+    version = request.args.get("version")
+    req_name = request.args.get("req_name")
+    mc_version = request.args.get("mc_version")
 
-    # Try to find by IP and username if username is provided
-    if username:
-        user = session.query(User).filter_by(ip_address=ip_address, username=username).first()
+    if not username and not uuid_param:
+        return api_docs_html_route()
 
-    # If not found and we have a username, try just by IP (in case username changed)
-    if not user:
-        user = session.query(User).filter_by(ip_address=ip_address).first()
+    uuid = dashed_uuid(uuid_param) if uuid_param else None
+    if not uuid and username:
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,16}", username):
+            abort(400, "username required")
 
-    now = datetime.now(timezone.utc)
+        normalized = normalize_username(username)
+        if normalized:
+            _, uuid = normalized
+        else:
+            with tx() as s:
+                uuid = get_uuid_from_history_by_name(s, username)
 
-    if not user:
-        # Create new user
-        user = User(
-            ip_address=ip_address,
-            username=username,
-            first_seen_at=now,
-            last_seen_at=now
-        )
-        session.add(user)
-        session.flush([user])
-        log.debug(f"Created new user: IP={ip_address}, username={username}")
-    else:
-        # Update last seen timestamp
-        user.last_seen_at = now
-        if username and not user.username:
-            # Update username if it wasn't set before
-            user.username = username
-        log.debug(f"Updated existing user: IP={ip_address}, username={username or user.username}")
+    if not uuid:
+        abort(404, "Profile not found")
 
-    return user
+    current_name = get_profile_by_uuid_from_mojang(uuid)
+    if not current_name:
+        abort(404, "Profile not found")
 
+    response_data = None
+    with tx() as s:
+        if not is_source_stale(s, uuid, "scraper", SCRAPER_STALE_HOURS):
+            response_data = query_history_public(s, uuid)
+        else:
+            response_data = _update_profile_from_sources(uuid, current_name)
 
-def log_request(session, ip_address: str, requester_username: Optional[str], requested_username: str,
-                source: Optional[str], version: Optional[str], endpoint: str, response_status: int,
-                mc_version: Optional[str] = None):
-    """Log a request to the database."""
-    if not requested_username:
-        log.warning(f"Cannot log request with empty requested_username for IP {ip_address}")
-        return
+    # Log the request
+    ip_address = (
+        request.headers.get("X-Forwarded-For", request.remote_addr or "unknown")
+        .split(",")[0]
+        .strip()
+    )
+    requester_username = req_name.strip() if req_name and req_name.strip() else None
+    requested_username = username or uuid
 
     try:
-        # Get or create user
-        user = get_or_create_user(session, ip_address, requester_username)
+        with tx() as s:
+            user = None
+            if requester_username:
+                user = s.query(User).filter_by(ip_address=ip_address, username=requester_username).first()
+            if not user:
+                user = s.query(User).filter_by(ip_address=ip_address).first()
+            now = datetime.now(timezone.utc)
+            if not user:
+                user = User(
+                    ip_address=ip_address,
+                    username=requester_username,
+                    first_seen_at=now,
+                    last_seen_at=now
+                )
+                s.add(user)
+                s.flush([user])
+            else:
+                user.last_seen_at = now
+                if requester_username and not user.username:
+                    user.username = requester_username
 
-        # Create request log entry
-        request_log = Request(
-            user_id=user.id,
-            requested_username=requested_username,
-            source=source,
-            version=version,
-            mc_version=mc_version,
-            endpoint=endpoint,
-            timestamp=datetime.now(timezone.utc),
-            response_status=response_status
-        )
-
-        session.add(request_log)
-        log.debug(
-            f"Logged request: user_id={user.id}, requester_username={requester_username}, "
-            f"requested_username={requested_username}, source={source}, version={version}, "
-            f"mc_version={mc_version}, endpoint={endpoint}, status={response_status}"
-        )
-
+            request_log = Request(
+                user_id=user.id,
+                requested_username=requested_username,
+                source=source,
+                version=version,
+                mc_version=mc_version,
+                endpoint=request.endpoint or "/api/namehistory",
+                timestamp=now,
+                response_status=200
+            )
+            s.add(request_log)
     except Exception as e:
-        log.error(f"Failed to log request for IP {ip_address}: {e}")
-        # Don't raise the exception - logging shouldn't break the API
+        log.error(f"Failed to log request: {e}")
 
+    return jsonify(response_data)
 
-# --- FLASK API ---
+@app.route("/api/namehistory/update", methods=["POST"])
+@require_auth(AuthLevel.API)
+def api_update():# --- FLASK API ---
 app = Flask(__name__)
 RATE_BUCKET, RATE_LOCK = {}, threading.Lock()
 
@@ -833,7 +861,7 @@ def get_openapi_spec():
             "description": "An API to track Minecraft player name history.",
         },
         "paths": {
-            "/api/namehistory/get": {
+            "/api/namehistory": {
                 "get": {
                     "summary": "Get name history by username",
                     "parameters": [
@@ -850,9 +878,24 @@ def get_openapi_spec():
                         "400": {"description": "Invalid username"},
                         "404": {"description": "Username not found"},
                     },
-                }
-            },
-            "/api/namehistory": {
+                },
+                "post": {
+                    "summary": "Get name history by username",
+                    "parameters": [
+                        {
+                            "name": "username",
+                            "in": "query",
+                            "required": True,
+                            "schema": {"type": "string"},
+                            "description": "The Minecraft username.",
+                        }
+                    ],
+                    "responses": {
+                        "200": {"description": "Successful response"},
+                        "400": {"description": "Invalid username"},
+                        "404": {"description": "Username not found"},
+                    },
+                },
                 "delete": {
                     "summary": "Delete a profile",
                     "security": [{"AdminKey": []}],
@@ -875,24 +918,6 @@ def get_openapi_spec():
                         "400": {"description": "Username or UUID required"},
                         "401": {"description": "Admin authorization required"},
                         "404": {"description": "Profile not found"},
-                    },
-                }
-            },
-            "/api/namehistory/uuid/{uuid}": {
-                "get": {
-                    "summary": "Get name history by UUID",
-                    "parameters": [
-                        {
-                            "name": "uuid",
-                            "in": "path",
-                            "required": True,
-                            "schema": {"type": "string"},
-                            "description": "The player's UUID.",
-                        }
-                    ],
-                    "responses": {
-                        "200": {"description": "Successful response"},
-                        "404": {"description": "UUID not found"},
                     },
                 }
             },
@@ -948,14 +973,29 @@ def get_openapi_spec():
 
 def get_docs_html(base_url):
     """Returns a simple, professional HTML documentation page using Pico CSS."""
+    api_key_required = bool(API_KEY)
+    admin_key_required = bool(ADMIN_KEY)
+
     return f"""
     <!DOCTYPE html>
-    <html lang="en">
+    <html lang="en" data-theme="dark">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Player History API Docs</title>
         <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+        <style>
+            .button-group {{
+                display: flex;
+                gap: 0.5rem;
+            }}
+            .try-it-output {{
+                margin-top: 1rem;
+                background-color: #f0f0f0;
+                padding: 1rem;
+                border-radius: 0.5rem;
+            }}
+        </style>
     </head>
     <body>
         <main class="container">
@@ -966,115 +1006,106 @@ def get_docs_html(base_url):
             </header>
 
             <article>
-                <h2><kbd>GET</kbd> /api/namehistory/get</h2>
-                <p>Retrieves the name history for a given Minecraft username.</p>
+                <h2><kbd>GET</kbd> /api/namehistory</h2>
+                <p>Retrieves the name history for a given Minecraft username or UUID.</p>
                 <h4>Parameters</h4>
                 <ul>
-                    <li><code>username</code> (query, required): The Minecraft username.</li>
+                    <li><code>username</code> (query): The Minecraft username.</li>
+                    <li><code>uuid</code> (query): The player's UUID.</li>
                 </ul>
-                <h4>Example</h4>
-                <blockquote><pre><code>curl "{base_url}api/namehistory/get?username=Notch"</code></pre></blockquote>
+                <div class="button-group">
+                    <button onclick="tryIt('get', 'Notch')">Try It with username</button>
+                    <button onclick="copyCurl('get', 'Notch')">Copy Curl Command (username)</button>
+                </div>
+                <div class="button-group" style="margin-top: 1rem;">
+                    <button onclick="tryIt('uuid', '069a79f4-44e9-4726-a5be-fca90e38aaf5')">Try It with UUID</button>
+                    <button onclick="copyCurl('uuid', '069a79f4-44e9-4726-a5be-fca90e38aaf5')">Copy Curl Command (UUID)</button>
+                </div>
+                <pre id="get-output" class="try-it-output" style="display:none;"></pre>
+                <pre id="uuid-output" class="try-it-output" style="display:none;"></pre>
             </article>
 
             <article>
-                <h2><kbd>GET</kbd> /api/namehistory/uuid/{{uuid}}</h2>
-                <p>Retrieves the name history for a given player UUID.</p>
-                <h4>Parameters</h4>
-                <ul>
-                    <li><code>uuid</code> (path, required): The player's UUID.</li>
-                </ul>
-                <h4>Example</h4>
-                <blockquote><pre><code>curl "{base_url}api/namehistory/uuid/069a79f4-44e9-4726-a5be-fca90e38aaf5"</code></pre></blockquote>
-            </article>
-
-            <article>
-                <h2><kbd>POST</kbd> /api/namehistory/update <small>Requires API Key</small></h2>
+                <h2><kbd>POST</kbd> /api/namehistory/update {'<small>Requires API Key</small>' if api_key_required else ''}</h2>
                 <p>Forces an immediate update for one or more player profiles from external sources.</p>
                 <h4>Request Body (JSON)</h4>
                 <blockquote><pre><code>{{
     "usernames": ["Notch", "jeb_"],
     "uuids": ["069a79f4-44e9-4726-a5be-fca90e38aaf5"]
 }}</code></pre></blockquote>
-                <h4>Example</h4>
-                <blockquote><pre><code>curl -X POST -H "Content-Type: application/json" -H "Authorization: API-Key YOUR_API_KEY" \\
--d '{{"usernames": ["Notch"]}}' "{base_url}api/namehistory/update"</code></pre></blockquote>
+                <div class="button-group">
+                    <button onclick="copyCurl('update')">Copy Curl Command</button>
+                </div>
             </article>
 
             <article>
-                <h2><kbd>DELETE</kbd> /api/namehistory <small>Requires Admin Key</small></h2>
+                <h2><kbd>DELETE</kbd> /api/namehistory/delete</h2>
                 <p>Deletes a player's entire profile and name history from the database.</p>
                 <h4>Parameters</h4>
                 <ul>
                     <li><code>username</code> (query) or <code>uuid</code> (query): The identifier for the profile to delete.</li>
                 </ul>
-                <h4>Example</h4>
-                <blockquote><pre><code>curl -X DELETE -H "Authorization: Admin-Key YOUR_ADMIN_KEY" "{base_url}api/namehistory?username=Notch"</code></pre></blockquote>
+                <div class="button-group">
+                    <button onclick="copyCurl('delete')">Copy Curl Command</button>
+                </div>
             </article>
         </main>
-    </body>
-    </html>
-    """
-
-def get_interactive_docs_html(base_url):
-    """Returns an interactive HTML page for the documentation."""
-    prefilled_url = base_url + 'api/namehistory/'
-    return f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Interactive Player History API Docs</title>
-        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
-    </head>
-    <body>
-        <main class="container">
-            <header>
-                <h1>Interactive API Documentation</h1>
-                <p>Please enter the URL of the correct API endpoint.</p>
-            </header>
-            <form id="docs-form">
-                <label for="api-url">API Endpoint URL</label>
-                <input type="text" id="api-url" name="api-url" value="{prefilled_url}" required>
-                <button type="submit">Load Documentation</button>
-            </form>
-            <hr>
-            <div id="docs-content"></div>
-        </main>
         <script>
-            document.getElementById('docs-form').addEventListener('submit', function(event) {{
-                event.preventDefault();
-                let url = document.getElementById('api-url').value;
-                if (!url.endsWith('/')) {{
-                    url += '/';
+            function getBaseUrl() {{
+                return window.location.origin + '/';
+            }}
+
+            function tryIt(type, param) {{
+                const baseUrl = getBaseUrl();
+                let url = '';
+                if (type === 'get') {{
+                    url = `${{baseUrl}}api/namehistory?username=${{param}}`;
+                }} else if (type === 'uuid') {{
+                    url = `${{baseUrl}}api/namehistory?uuid=${{param}}`;
                 }}
+
+                const output = document.getElementById(`${{type}}-output`);
+                output.style.display = 'block';
+                output.textContent = 'Loading...';
+
                 fetch(url)
-                    .then(response => response.text())
-                    .then(html => {{
-                        document.getElementById('docs-content').innerHTML = html;
+                    .then(response => response.json())
+                    .then(data => {{
+                        output.textContent = JSON.stringify(data, null, 2);
                     }})
                     .catch(error => {{
-                        console.error('Error loading documentation:', error);
-                        document.getElementById('docs-content').innerHTML = '<p>Error loading documentation. Please check the URL and try again.</p>';
+                        output.textContent = `Error: ${{error}}`;
                     }});
-            }});
+            }}
+
+            function copyCurl(type, param) {{
+                const baseUrl = getBaseUrl();
+                let command = '';
+                if (type === 'get') {{
+                    command = `curl "${{baseUrl}}api/namehistory?username=${{param}}"`;
+                }} else if (type === 'uuid') {{
+                    command = `curl "${{baseUrl}}api/namehistory?uuid=${{param}}"`;
+                }} else if (type === 'update') {{
+                    command = `curl -X POST -H "Content-Type: application/json" {'-H "Authorization: API-Key YOUR_API_KEY" ' if api_key_required else ''}-d '{{"usernames": ["Notch"]}}' "${{baseUrl}}api/namehistory/update"`;
+                }} else if (type === 'delete') {{
+                    command = `curl -X DELETE {'-H "Authorization: Admin-Key YOUR_ADMIN_KEY" ' if admin_key_required else ''}"${{baseUrl}}api/namehistory/delete?username=Notch"`;
+                }}
+
+                navigator.clipboard.writeText(command).then(() => {{
+                    alert('Curl command copied to clipboard!');
+                }});
+            }}
         </script>
     </body>
     </html>
     """
-
-@app.route("/docs/namehistory", methods=["GET"])
-def interactive_docs():
-    base_url = request.host_url
-    return get_interactive_docs_html(base_url)
-
 
 @app.route("/api/namehistory/docs.json", methods=["GET"])
 def api_docs_json():
     return jsonify(get_openapi_spec())
 
 @app.route("/api/namehistory/", methods=["GET"])
-def api_docs_html():
+def api_docs_html_route():
     base_url = request.host_url
     return get_docs_html(base_url)
 
@@ -1103,173 +1134,6 @@ def _apply_rate_limit():
         if len(bucket) >= RATE_LIMIT_RPM:
             abort(429)
         bucket.append(now)
-
-
-@app.route("/api/namehistory/get", methods=["GET"])
-def api_namehistory():
-    username = request.args.get("username", "").strip()
-    source = request.args.get("source")
-    version = request.args.get("version")
-    req_name = request.args.get("req_name")
-    mc_version = request.args.get("mc_version")
-
-    if not re.fullmatch(r"[A-Za-z0-9_]{1,16}", username):
-        abort(400, "username required")
-
-    normalized = normalize_username(username)
-    uuid, current_name = (None, None)
-    if normalized:
-        current_name, uuid = normalized
-    else:
-        with tx() as s:
-            uuid = get_uuid_from_history_by_name(s, username)
-        if uuid:
-            current_name = get_profile_by_uuid_from_mojang(uuid)
-
-    if not uuid or not current_name:
-        abort(404, "Username not found")
-
-    response_data = None
-    with tx() as s:
-        if not is_source_stale(s, uuid, "scraper", SCRAPER_STALE_HOURS):
-            response_data = query_history_public(s, uuid)
-        else:
-            response_data = _update_profile_from_sources(uuid, current_name)
-
-    # Log the request
-    ip_address = (
-        request.headers.get("X-Forwarded-For", request.remote_addr or "unknown")
-        .split(",")[0]
-        .strip()
-    )
-    requester_username = req_name.strip() if req_name and req_name.strip() else None
-    requested_username = username
-
-    try:
-        with tx() as s:
-            log_request(
-                session=s,
-                ip_address=ip_address,
-                requester_username=requester_username,
-                requested_username=requested_username,
-                source=source,
-                version=version,
-                endpoint=request.endpoint or "/api/namehistory/get",
-                response_status=200,
-                mc_version=mc_version,
-            )
-    except Exception as e:
-        log.error(f"Failed to log request: {e}")
-
-    return jsonify(response_data)
-
-
-@app.route("/api/namehistory/uuid/<uuid>", methods=["GET"])
-def api_namehistory_by_uuid(uuid):
-    uuid = dashed_uuid(uuid)
-    source = request.args.get("source")
-    version = request.args.get("version")
-    req_name = request.args.get("req_name")
-    mc_version = request.args.get("mc_version")
-
-    current_name = get_profile_by_uuid_from_mojang(uuid)
-    if not current_name:
-        abort(404, "UUID not found")
-
-    response_data = None
-    with tx() as s:
-        if not is_source_stale(s, uuid, "scraper", SCRAPER_STALE_HOURS):
-            response_data = query_history_public(s, uuid)
-        else:
-            response_data = _update_profile_from_sources(uuid, current_name)
-
-    # Log the request
-    ip_address = (
-        request.headers.get("X-Forwarded-For", request.remote_addr or "unknown")
-        .split(",")[0]
-        .strip()
-    )
-
-    requester_username = req_name.strip() if req_name and req_name.strip() else None
-    requested_username = current_name
-
-    try:
-        with tx() as s:
-            log_request(
-                session=s,
-                ip_address=ip_address,
-                requester_username=requester_username,
-                requested_username=requested_username,
-                source=source,
-                version=version,
-                endpoint=request.endpoint or "/api/namehistory/uuid/<uuid>",
-                response_status=200,
-                mc_version=mc_version,
-            )
-    except Exception as e:
-        log.error(f"Failed to log request: {e}")
-
-    return jsonify(response_data)
-
-
-@app.route("/api/namehistory", methods=["DELETE"])
-@require_auth(AuthLevel.ADMIN)
-def api_delete():
-    username = request.args.get("username", "").strip()
-    uuid_param = request.args.get("uuid", "").strip()
-    source = request.args.get("source")
-    version = request.args.get("version")
-    req_name = request.args.get("req_name")
-    mc_version = request.args.get("mc_version")
-
-    if not username and not uuid_param:
-        abort(400, "username or uuid required")
-
-    uuid = dashed_uuid(uuid_param) if uuid_param else None
-    if not uuid and username:
-        norm = normalize_username(username)
-        if norm:
-            _, uuid = norm
-        else:
-            with tx() as s:
-                uuid = get_uuid_from_history_by_name(s, username)
-
-    if not uuid:
-        abort(404, "Profile not found")
-
-    response_data = None
-    with tx() as s:
-        if not delete_profile(s, uuid):
-            abort(404, "Profile not found in database")
-        response_data = {"message": "Profile deleted", "uuid": uuid}
-
-    # Log the request
-    ip_address = (
-        request.headers.get("X-Forwarded-For", request.remote_addr or "unknown")
-        .split(",")[0]
-        .strip()
-    )
-
-    requester_username = req_name.strip() if req_name and req_name.strip() else (username or None)
-    requested_username = username or uuid
-
-    try:
-        with tx() as s:
-            log_request(
-                session=s,
-                ip_address=ip_address,
-                requester_username=requester_username,
-                requested_username=requested_username,
-                source=source,
-                version=version,
-                endpoint=request.endpoint or "/api/namehistory",
-                response_status=200,
-                mc_version=mc_version,
-            )
-    except Exception as e:
-        log.error(f"Failed to log request: {e}")
-
-    return jsonify(response_data)
 
 
 @app.route("/api/namehistory/update", methods=["POST"])
