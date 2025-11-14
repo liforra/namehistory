@@ -823,6 +823,262 @@ app = Flask(__name__)
 RATE_BUCKET, RATE_LOCK = {}, threading.Lock()
 
 
+def get_openapi_spec():
+    """Generates the OpenAPI 3.0 specification for the API."""
+    spec = {
+        "openapi": "3.0.0",
+        "info": {
+            "title": "Player History API",
+            "version": "1.0.0",
+            "description": "An API to track Minecraft player name history.",
+        },
+        "paths": {
+            "/api/namehistory/get": {
+                "get": {
+                    "summary": "Get name history by username",
+                    "parameters": [
+                        {
+                            "name": "username",
+                            "in": "query",
+                            "required": True,
+                            "schema": {"type": "string"},
+                            "description": "The Minecraft username.",
+                        }
+                    ],
+                    "responses": {
+                        "200": {"description": "Successful response"},
+                        "400": {"description": "Invalid username"},
+                        "404": {"description": "Username not found"},
+                    },
+                }
+            },
+            "/api/namehistory": {
+                "delete": {
+                    "summary": "Delete a profile",
+                    "security": [{"AdminKey": []}],
+                    "parameters": [
+                        {
+                            "name": "username",
+                            "in": "query",
+                            "schema": {"type": "string"},
+                            "description": "The Minecraft username to delete.",
+                        },
+                        {
+                            "name": "uuid",
+                            "in": "query",
+                            "schema": {"type": "string"},
+                            "description": "The UUID of the profile to delete.",
+                        },
+                    ],
+                    "responses": {
+                        "200": {"description": "Profile deleted"},
+                        "400": {"description": "Username or UUID required"},
+                        "401": {"description": "Admin authorization required"},
+                        "404": {"description": "Profile not found"},
+                    },
+                }
+            },
+            "/api/namehistory/uuid/{uuid}": {
+                "get": {
+                    "summary": "Get name history by UUID",
+                    "parameters": [
+                        {
+                            "name": "uuid",
+                            "in": "path",
+                            "required": True,
+                            "schema": {"type": "string"},
+                            "description": "The player's UUID.",
+                        }
+                    ],
+                    "responses": {
+                        "200": {"description": "Successful response"},
+                        "404": {"description": "UUID not found"},
+                    },
+                }
+            },
+            "/api/namehistory/update": {
+                "post": {
+                    "summary": "Force-update profiles",
+                    "security": [{"ApiKey": []}],
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "usernames": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                        },
+                                        "uuids": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                        },
+                                    },
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {"description": "Update process completed"},
+                        "401": {"description": "API authorization required"},
+                    },
+                }
+            },
+        },
+        "components": {
+            "securitySchemes": {
+                "ApiKey": {
+                    "type": "apiKey",
+                    "in": "header",
+                    "name": "Authorization",
+                    "description": "API key for write-like actions. Use 'API-Key <token>'.",
+                },
+                "AdminKey": {
+                    "type": "apiKey",
+                    "in": "header",
+                    "name": "Authorization",
+                    "description": "Admin key for admin actions. Use 'Admin-Key <token>'.",
+                },
+            }
+        },
+    }
+    return spec
+
+
+def get_docs_html(base_url):
+    """Returns a simple, professional HTML documentation page using Pico CSS."""
+    return f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Player History API Docs</title>
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    </head>
+    <body>
+        <main class="container">
+            <header>
+                <h1>Player History API Documentation</h1>
+                <p>This API allows you to track the name history of Minecraft players.</p>
+                <p>The OpenAPI specification is available at <a href="/api/namehistory/docs.json">/api/namehistory/docs.json</a>.</p>
+            </header>
+
+            <article>
+                <h2><kbd>GET</kbd> /api/namehistory/get</h2>
+                <p>Retrieves the name history for a given Minecraft username.</p>
+                <h4>Parameters</h4>
+                <ul>
+                    <li><code>username</code> (query, required): The Minecraft username.</li>
+                </ul>
+                <h4>Example</h4>
+                <blockquote><pre><code>curl "{base_url}api/namehistory/get?username=Notch"</code></pre></blockquote>
+            </article>
+
+            <article>
+                <h2><kbd>GET</kbd> /api/namehistory/uuid/{{uuid}}</h2>
+                <p>Retrieves the name history for a given player UUID.</p>
+                <h4>Parameters</h4>
+                <ul>
+                    <li><code>uuid</code> (path, required): The player's UUID.</li>
+                </ul>
+                <h4>Example</h4>
+                <blockquote><pre><code>curl "{base_url}api/namehistory/uuid/069a79f4-44e9-4726-a5be-fca90e38aaf5"</code></pre></blockquote>
+            </article>
+
+            <article>
+                <h2><kbd>POST</kbd> /api/namehistory/update <small>Requires API Key</small></h2>
+                <p>Forces an immediate update for one or more player profiles from external sources.</p>
+                <h4>Request Body (JSON)</h4>
+                <blockquote><pre><code>{{
+    "usernames": ["Notch", "jeb_"],
+    "uuids": ["069a79f4-44e9-4726-a5be-fca90e38aaf5"]
+}}</code></pre></blockquote>
+                <h4>Example</h4>
+                <blockquote><pre><code>curl -X POST -H "Content-Type: application/json" -H "Authorization: API-Key YOUR_API_KEY" \\
+-d '{{"usernames": ["Notch"]}}' "{base_url}api/namehistory/update"</code></pre></blockquote>
+            </article>
+
+            <article>
+                <h2><kbd>DELETE</kbd> /api/namehistory <small>Requires Admin Key</small></h2>
+                <p>Deletes a player's entire profile and name history from the database.</p>
+                <h4>Parameters</h4>
+                <ul>
+                    <li><code>username</code> (query) or <code>uuid</code> (query): The identifier for the profile to delete.</li>
+                </ul>
+                <h4>Example</h4>
+                <blockquote><pre><code>curl -X DELETE -H "Authorization: Admin-Key YOUR_ADMIN_KEY" "{base_url}api/namehistory?username=Notch"</code></pre></blockquote>
+            </article>
+        </main>
+    </body>
+    </html>
+    """
+
+def get_interactive_docs_html(base_url):
+    """Returns an interactive HTML page for the documentation."""
+    prefilled_url = base_url + 'api/namehistory/'
+    return f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Interactive Player History API Docs</title>
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    </head>
+    <body>
+        <main class="container">
+            <header>
+                <h1>Interactive API Documentation</h1>
+                <p>Please enter the URL of the correct API endpoint.</p>
+            </header>
+            <form id="docs-form">
+                <label for="api-url">API Endpoint URL</label>
+                <input type="text" id="api-url" name="api-url" value="{prefilled_url}" required>
+                <button type="submit">Load Documentation</button>
+            </form>
+            <hr>
+            <div id="docs-content"></div>
+        </main>
+        <script>
+            document.getElementById('docs-form').addEventListener('submit', function(event) {{
+                event.preventDefault();
+                let url = document.getElementById('api-url').value;
+                if (!url.endsWith('/')) {{
+                    url += '/';
+                }}
+                fetch(url)
+                    .then(response => response.text())
+                    .then(html => {{
+                        document.getElementById('docs-content').innerHTML = html;
+                    }})
+                    .catch(error => {{
+                        console.error('Error loading documentation:', error);
+                        document.getElementById('docs-content').innerHTML = '<p>Error loading documentation. Please check the URL and try again.</p>';
+                    }});
+            }});
+        </script>
+    </body>
+    </html>
+    """
+
+@app.route("/docs/namehistory", methods=["GET"])
+def interactive_docs():
+    base_url = request.host_url
+    return get_interactive_docs_html(base_url)
+
+
+@app.route("/api/namehistory/docs.json", methods=["GET"])
+def api_docs_json():
+    return jsonify(get_openapi_spec())
+
+@app.route("/api/namehistory/", methods=["GET"])
+def api_docs_html():
+    base_url = request.host_url
+    return get_docs_html(base_url)
+
+
 @app.errorhandler(HTTPException)
 def handle_exception(e: HTTPException):
     response = e.get_response()
@@ -849,7 +1105,7 @@ def _apply_rate_limit():
         bucket.append(now)
 
 
-@app.route("/api/namehistory", methods=["GET"])
+@app.route("/api/namehistory/get", methods=["GET"])
 def api_namehistory():
     username = request.args.get("username", "").strip()
     source = request.args.get("source")
@@ -898,7 +1154,7 @@ def api_namehistory():
                 requested_username=requested_username,
                 source=source,
                 version=version,
-                endpoint=request.endpoint or "/api/namehistory",
+                endpoint=request.endpoint or "/api/namehistory/get",
                 response_status=200,
                 mc_version=mc_version,
             )
