@@ -8,6 +8,8 @@
 
 PlayerHistoryAPI is a Python-based API server for retrieving, storing, and managing Minecraft player name history. It aggregates data from Mojang, NameMC, and Laby.net, and provides a local cache and REST API for efficient and privacy-friendly lookups.
 
+Main Repository on [Codeberg](https://codeberg.org/liforra/namehistory), read-only Mirror on [Github](https://github.com/liforra/namehistory)
+
 ## Features
 
 - **Fetches Minecraft player name history** from Mojang, NameMC, and Laby.net
