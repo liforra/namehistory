@@ -8,6 +8,7 @@ import json
 import random
 import threading
 import argparse
+from pathlib import Path
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -29,14 +30,27 @@ from sqlalchemy.orm import (
     relationship,
     scoped_session,
 )
-from curl_cffi.requests import Session
+from providers.http_client import create_scraper_session, fetch_with_fallback
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, jsonify, request, abort
 from werkzeug.exceptions import HTTPException
 
+from minecraft_api import client_profile_models, register_minecraft_routes
+from config_loader import load_config
+from challenge_store import (
+    ChallengeTokenStore,
+    challenge_token_models,
+    delete_token_from_db,
+    load_tokens_from_db,
+    persist_token_to_db,
+)
+from captcha_routes import register_captcha_routes
+from votes_api import register_votes_routes
+from skin_assets import SkinAssetStore, register_skin_routes, skin_public_urls
+
 try:
-    import tomli as toml
+    import tomli as toml  # noqa: F401 — used by config_loader
 except ImportError:
     toml = None
 
@@ -44,50 +58,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # --- CONFIGURATION ---
-CONFIG: Dict[str, Any] = {
-    "server": {"host": "127.0.0.1", "port": 8000},
-    "rate_limit": {"rpm": 15, "window_seconds": 60},
-    # Optional auth: if unset, all endpoints remain open (backward compatible)
-    # If auth.api_key is set, write-like actions require "Authorization: API-Key <value>"
-    # If auth.admin_key is set, admin actions require "Authorization: Admin-Key <value>"
-    # Admin-Key also satisfies API-Key checks if both are set.
-    "auth": {"api_key": "", "admin_key": ""},
-    "fetch": {
-        "default_sleep": 0.5,
-        "bulk_min_delay": 0.8,
-        "bulk_max_delay": 1.5,
-    },
-    "database": {"type": "sqlite", "path": "namehistory.db"},
-    "logging": {
-        "level": "INFO",
-        "json": False,
-        "file": "",
-        "max_bytes": 10_485_760,
-        "backup_count": 3,
-    },
-    "auto_update": {
-        "enabled": True,
-        "check_interval_minutes": 60,
-        "scraper_stale_hours": 24,
-        "batch_size": 10,
-    },
-}
-
-
-def load_config():
-    global CONFIG
-    path = "config.toml"
-    if toml and os.path.exists(path):
-        with open(path, "rb") as f:
-            data = toml.load(f)
-        for k, v in data.items():
-            if isinstance(v, dict) and k in CONFIG:
-                CONFIG[k].update(v)
-            else:
-                CONFIG[k] = v
-
-
-load_config()
+CONFIG: Dict[str, Any] = load_config()
 
 HOST = CONFIG["server"]["host"]
 PORT = int(CONFIG["server"]["port"])
@@ -105,6 +76,24 @@ SCRAPER_STALE_HOURS = int(CONFIG["auto_update"]["scraper_stale_hours"])
 AUTO_UPDATE_BATCH_SIZE = int(CONFIG["auto_update"]["batch_size"])
 API_KEY = str(CONFIG.get("auth", {}).get("api_key", "") or "").strip()
 ADMIN_KEY = str(CONFIG.get("auth", {}).get("admin_key", "") or "").strip()
+HYPIXEL_API_KEY = str(CONFIG.get("providers", {}).get("hypixel_api_key", "") or "").strip()
+CHALLENGE_TTL_MINUTES = int(CONFIG.get("providers", {}).get("challenge_ttl_minutes", 45))
+VOTES_CONFIG = CONFIG.get("votes") or {}
+SKIN_CACHE_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    str(CONFIG.get("skins", {}).get("cache_dir", "skin_cache")),
+)
+LABY_TURNSTILE_SITE_KEY = str(
+    CONFIG.get("providers", {}).get("laby_turnstile_site_key", "") or ""
+).strip()
+LABY_CHALLENGE_HEADER = str(
+    CONFIG.get("providers", {}).get("laby_challenge_header", "X-Challenge-Token") or ""
+).strip()
+LABY_CHALLENGE_TOKEN = str(
+    os.environ.get("LABY_CHALLENGE_TOKEN")
+    or CONFIG.get("providers", {}).get("laby_challenge_token", "")
+    or ""
+).strip()
 
 # --- LOGGING SETUP ---
 def setup_logging():
@@ -148,6 +137,12 @@ def setup_logging():
 
 setup_logging()
 log = logging.getLogger("namehistory")
+
+if not HYPIXEL_API_KEY:
+    log.warning(
+        "HYPIXEL_API_KEY not set — hypixel profile data will be unavailable. "
+        "Set it in .env or providers.hypixel_api_key in config.toml"
+    )
 
 # --- AUTH HELPERS ---
 class AuthLevel:
@@ -213,11 +208,27 @@ def require_auth(level: int):
     return decorator
 
 
+def check_api_auth():
+    """Raise 401 if API key is configured and request is not authorized."""
+    if not API_KEY:
+        return
+    scheme, token = _extract_auth_token()
+    if (scheme == "API-Key" and token == API_KEY) or (
+        ADMIN_KEY and scheme == "Admin-Key" and token == ADMIN_KEY
+    ):
+        return
+    abort(401, description="API authorization required")
+
+
 # --- HTTP & UTILS ---
 UA_POOL = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 ]
-scraper_session = Session(impersonate="chrome110")
+scraper_session = create_scraper_session("chrome124")
+skin_store = SkinAssetStore(
+    Path(SKIN_CACHE_DIR),
+    lambda url, **kwargs: scraper_session.get(url, **kwargs),
+)
 mojang_session = requests.Session()
 MCS_LOOKUP = (
     "https://api.minecraftservices.com/minecraft/profile/lookup/name/{name}"
@@ -283,10 +294,14 @@ def get_profile_by_uuid_from_mojang(uuid: str) -> Optional[str]:
 
 def fetch_profile_html(url: str) -> str:
     try:
-        r = scraper_session.get(
-            url, headers={"User-Agent": random.choice(UA_POOL)}, timeout=15.0
+        r = fetch_with_fallback(
+            url,
+            session=scraper_session,
+            headers={"User-Agent": random.choice(UA_POOL)},
+            timeout=15.0,
+            allow=[200],
         )
-        return r.text if r.status_code == 200 else ""
+        return r.text if r and r.status_code == 200 else ""
     except Exception:
         return ""
 
@@ -340,6 +355,130 @@ def fetch_namemc_data(username: str) -> List[Dict[str, Optional[str]]]:
             )
 
     return out
+
+
+def fetch_laby_skin_data(uuid: str) -> List[Dict[str, Optional[str]]]:
+    url = f"https://laby.net/api/user/{uuid}/get-textures"
+    try:
+        r = scraper_session.get(
+            url, headers={"Accept": "application/json"}, timeout=10
+        )
+        if r.status_code != 200:
+            return []
+        return [
+            {
+                "skin_hash": e.get("image_hash"),
+                "file_hash": e.get("file_hash"),
+                "changedAt": e.get("first_seen_at"),
+                "slim": e.get("slim_skin"),
+                "source": "laby",
+            }
+            for e in r.json().get("SKIN", [])
+            if e.get("image_hash")
+        ]
+    except Exception:
+        return []
+
+
+def _parse_namemc_skin_rows(soup: BeautifulSoup) -> List[Dict[str, Optional[str]]]:
+    """Extract skin history from a NameMC profile or skins page."""
+    out: List[Dict[str, Optional[str]]] = []
+    seen: set[str] = set()
+
+    def append_row(skin_hash: str, changed_at: Optional[str], slim: Optional[bool]):
+        if not skin_hash or skin_hash in seen:
+            return
+        seen.add(skin_hash)
+        out.append(
+            {
+                "skin_hash": skin_hash,
+                "file_hash": None,
+                "changedAt": changed_at,
+                "slim": slim,
+                "source": "namemc",
+            }
+        )
+
+    skins_card = None
+    for header in soup.find_all("div", class_="card-header"):
+        if "Skins" in header.get_text():
+            skins_card = header.find_parent("div", class_="card")
+            break
+
+    scope = skins_card or soup
+    for link in scope.find_all("a", href=re.compile(r"^/skin/[a-f0-9]+$")):
+        skin_hash = link["href"].strip("/").split("/")[-1]
+        canvas = link.find("canvas", class_=re.compile(r"skin-2d|skin-button"))
+        changed_at = None
+        slim = None
+        if canvas:
+            changed_at = (canvas.get("title") or "").strip() or None
+            model = (canvas.get("data-model") or "").lower()
+            if model == "slim":
+                slim = True
+            elif model == "classic":
+                slim = False
+        append_row(skin_hash, changed_at, slim)
+
+    if out:
+        return out
+
+    table = soup.select_one("table.table-borderless") or soup.select_one(
+        "table.table-striped"
+    )
+    if not table:
+        return []
+
+    tbody = table.find("tbody")
+    if not tbody:
+        return []
+
+    for row in tbody.find_all("tr"):
+        if "d-lg-none" in row.get("class", []):
+            continue
+
+        cells = row.find_all("td")
+        if len(cells) < 2:
+            continue
+
+        skin_hash = None
+        slim = None
+        for cell in cells:
+            link = cell.find("a", href=re.compile(r"/skin/"))
+            if link:
+                skin_hash = link["href"].strip("/").split("/")[-1]
+                img = cell.find("img")
+                if img and "slim" in (img.get("alt", "") + img.get("title", "")).lower():
+                    slim = True
+                break
+
+        changed_at = None
+        for cell in cells:
+            time_tag = cell.find("time")
+            if time_tag and time_tag.get("datetime"):
+                changed_at = time_tag["datetime"].strip()
+                break
+
+        if skin_hash:
+            append_row(skin_hash, changed_at, slim)
+
+    return out
+
+
+def fetch_namemc_skin_data(username: str) -> List[Dict[str, Optional[str]]]:
+    # NameMC removed /profile/{user}/skins; history lives on the main profile page.
+    for url in (
+        f"https://namemc.com/profile/{username}",
+        f"https://namemc.com/minecraft-skins/profile/{username}.1",
+        f"https://namemc.com/profile/{username}/skins",
+    ):
+        html = fetch_profile_html(url)
+        if not html:
+            continue
+        rows = _parse_namemc_skin_rows(BeautifulSoup(html, "html.parser"))
+        if rows:
+            return rows
+    return []
 
 
 def fetch_laby_api_data(uuid: str) -> List[Dict[str, Optional[str]]]:
@@ -490,8 +629,157 @@ def merge_remote_sources(
     return merged
 
 
+def gather_remote_skin_rows_by_uuid(
+    uuid: str, current_name: str
+) -> List[Dict[str, Optional[str]]]:
+    all_rows = []
+
+    log.debug(f"Fetching skin data from Laby API for UUID {uuid}")
+    laby_rows = fetch_laby_skin_data(uuid)
+    log.debug(f"Laby returned {len(laby_rows)} skin entries")
+    all_rows.extend(laby_rows)
+    jitter_sleep()
+
+    log.debug(f"Fetching skin data from NameMC for username {current_name}")
+    namemc_rows = fetch_namemc_skin_data(current_name)
+    log.debug(f"NameMC returned {len(namemc_rows)} skin entries")
+    all_rows.extend(namemc_rows)
+
+    return all_rows
+
+
+def get_current_skin_from_laby(uuid: str) -> Optional[Tuple[str, Optional[bool]]]:
+    try:
+        r = scraper_session.get(
+            f"https://laby.net/api/user/{uuid}/get-textures",
+            headers={"Accept": "application/json"},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        skins = r.json().get("SKIN", [])
+        for entry in skins:
+            if entry.get("active") and entry.get("image_hash"):
+                return entry["image_hash"], entry.get("slim_skin")
+        if skins:
+            latest = max(
+                skins,
+                key=lambda e: parse_timestamp(e.get("last_seen_at"))
+                or datetime.min.replace(tzinfo=timezone.utc),
+            )
+            if latest.get("image_hash"):
+                return latest["image_hash"], latest.get("slim_skin")
+    except Exception:
+        return None
+    return None
+
+
+def merge_remote_skin_sources(
+    rows: List[Dict[str, Optional[str]]], current_skin_hash: str
+) -> List[Tuple[str, Optional[str], Optional[str], Optional[bool]]]:
+    normalized_entries = []
+    for row in rows:
+        skin_hash = row.get("skin_hash")
+        changed_at = row.get("changedAt")
+        source = row.get("source", "unknown")
+
+        if skin_hash:
+            normalized_ts = normalize_timestamp(changed_at)
+            normalized_entries.append(
+                {
+                    "skin_hash": skin_hash,
+                    "file_hash": row.get("file_hash"),
+                    "slim": row.get("slim"),
+                    "timestamp": normalized_ts,
+                    "datetime": parse_timestamp(changed_at),
+                    "source": source,
+                }
+            )
+
+    log.debug(f"Processing {len(normalized_entries)} skin entries from all sources")
+
+    by_hash = defaultdict(list)
+    for entry in normalized_entries:
+        by_hash[entry["skin_hash"].lower()].append(entry)
+
+    cleaned_entries = []
+    for entries in by_hash.values():
+        has_null = any(e["timestamp"] is None for e in entries)
+        has_dated = any(e["timestamp"] is not None for e in entries)
+
+        if has_null and has_dated:
+            cleaned_entries.extend([e for e in entries if e["timestamp"] is not None])
+        else:
+            cleaned_entries.extend(entries)
+
+    cleaned_entries.sort(
+        key=lambda e: e["datetime"]
+        or datetime.min.replace(tzinfo=timezone.utc)
+    )
+
+    merged: List[Tuple[str, Optional[str], Optional[str], Optional[bool]]] = []
+    for entry in cleaned_entries:
+        skin_hash = entry["skin_hash"]
+        timestamp = entry["timestamp"]
+        file_hash = entry["file_hash"]
+        slim = entry["slim"]
+        source = entry["source"]
+
+        if merged:
+            last_hash, last_timestamp, _, _ = merged[-1]
+            if skin_hash.lower() == last_hash.lower():
+                last_dt = parse_timestamp(last_timestamp)
+                curr_dt = parse_timestamp(timestamp)
+
+                if curr_dt and last_dt and curr_dt < last_dt:
+                    log.debug(
+                        f"  Replacing skin {last_hash} @ {last_timestamp} with earlier {timestamp} (from {source})"
+                    )
+                    merged[-1] = (skin_hash, timestamp, file_hash, slim)
+                else:
+                    log.debug(
+                        f"  Skipping consecutive duplicate skin {skin_hash} @ {timestamp} (from {source})"
+                    )
+                continue
+
+        log.debug(f"  Adding skin {skin_hash} @ {timestamp} (from {source})")
+        merged.append((skin_hash, timestamp, file_hash, slim))
+
+    if merged:
+        existing_hashes = {entry[0].lower() for entry in merged}
+        if current_skin_hash.lower() not in existing_hashes:
+            log.debug(
+                f"  Adding current skin '{current_skin_hash}' (not in history)"
+            )
+            merged.append((current_skin_hash, None, None, None))
+    else:
+        log.debug(f"  Adding current skin '{current_skin_hash}' (empty history)")
+        merged.append((current_skin_hash, None, None, None))
+
+    log.info(f"Final merged skin result: {len(merged)} unique skin changes")
+
+    return merged
+
+
 # --- DATABASE ---
 Base = declarative_base()
+
+ClientProfileSnapshot, ClientCosmeticSnapshot = client_profile_models(Base)
+ChallengeToken = challenge_token_models(Base)
+challenge_store = ChallengeTokenStore(default_ttl_minutes=CHALLENGE_TTL_MINUTES)
+if LABY_CHALLENGE_TOKEN:
+    challenge_store.set("labymod", LABY_CHALLENGE_TOKEN, source="config")
+
+
+def sync_challenge_tokens() -> None:
+    with tx() as session:
+        load_tokens_from_db(session, ChallengeToken, challenge_store)
+
+
+def invalidate_challenge_token(provider: str) -> None:
+    challenge_store.clear(provider)
+    with tx() as session:
+        delete_token_from_db(session, ChallengeToken, provider)
 
 
 class Profile(Base):
@@ -504,6 +792,21 @@ class Profile(Base):
     )
     source_updates = relationship(
         "SourceUpdate",
+        back_populates="profile",
+        cascade="all, delete-orphan",
+    )
+    skin_history = relationship(
+        "SkinHistory",
+        back_populates="profile",
+        cascade="all, delete-orphan",
+    )
+    client_profiles = relationship(
+        "ClientProfileSnapshot",
+        back_populates="profile",
+        cascade="all, delete-orphan",
+    )
+    client_cosmetics = relationship(
+        "ClientCosmeticSnapshot",
         back_populates="profile",
         cascade="all, delete-orphan",
     )
@@ -523,6 +826,24 @@ class History(Base):
     observed_at = Column(DateTime, nullable=False)
     profile = relationship("Profile", back_populates="history")
     __table_args__ = (UniqueConstraint("uuid", "name", "changed_at"),)
+
+
+class SkinHistory(Base):
+    __tablename__ = "skin_history"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    uuid = Column(
+        String(36),
+        ForeignKey("profiles.uuid", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    skin_hash = Column(String(64), nullable=False, index=True)
+    file_hash = Column(String(64), index=True)
+    slim = Column(Integer)
+    changed_at = Column(String(32), index=True)
+    observed_at = Column(DateTime, nullable=False)
+    profile = relationship("Profile", back_populates="skin_history")
+    __table_args__ = (UniqueConstraint("uuid", "skin_hash", "changed_at"),)
 
 
 class SourceUpdate(Base):
@@ -592,12 +913,21 @@ def init_db():
         except Exception:
             requests_exists = False
 
-    # If tables don't exist, they were just created above
-    # If they do exist, log that the database is up to date
+        try:
+            result = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='client_profile_snapshots'"
+            )
+            client_profiles_exists = result.fetchone() is not None
+        except Exception:
+            client_profiles_exists = False
+
     if users_exists and requests_exists:
         log.info("Database already contains logging tables (users, requests)")
     else:
         log.info("Database migration completed - added logging tables (users, requests)")
+
+    if not client_profiles_exists:
+        log.info("Database migration completed - added client profile tables")
 
 
 @contextmanager
@@ -632,6 +962,32 @@ def get_uuid_from_history_by_name(session, username: str) -> Optional[str]:
         .first()
     )
     return row[0] if row else None
+
+
+def resolve_player(
+    username: str, uuid_param: str
+) -> Tuple[Optional[str], str, Optional[str]]:
+    """Resolve UUID, query username, and current Mojang name."""
+    uuid = dashed_uuid(uuid_param) if uuid_param else None
+    if not uuid and username:
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,16}", username):
+            abort(400, "username required")
+
+        normalized = normalize_username(username)
+        if normalized:
+            _, uuid = normalized
+        else:
+            with tx() as s:
+                uuid = get_uuid_from_history_by_name(s, username)
+
+    if not uuid:
+        return None, username, None
+
+    current_name = get_profile_by_uuid_from_mojang(uuid)
+    if not current_name and not username:
+        return None, username, None
+
+    return uuid, username or current_name or "", current_name
 
 
 def update_source_timestamp(session, uuid: str, source: str):
@@ -756,7 +1112,134 @@ def _update_profile_from_sources(uuid: str, current_name: str) -> Dict[str, Any]
         return query_history_public(con, uuid)
 
 
+def query_skin_history_public(session, uuid: str) -> Dict[str, Any]:
+    profile = session.get(Profile, uuid)
+    if not profile:
+        return {
+            "query": None,
+            "uuid": uuid,
+            "last_seen_at": None,
+            "history": [],
+        }
+
+    rows = session.query(SkinHistory).filter_by(uuid=uuid).all()
+
+    def sort_key(r):
+        if r.changed_at is None:
+            return ""
+        return r.changed_at
+
+    rows.sort(key=sort_key)
+
+    history = []
+    for i, r in enumerate(rows):
+        entry = {
+            "id": i + 1,
+            "skin_hash": r.skin_hash,
+            "file_hash": r.file_hash,
+            "slim": bool(r.slim) if r.slim is not None else None,
+            "changed_at": r.changed_at,
+            "observed_at": r.observed_at.isoformat(),
+        }
+        entry.update(skin_public_urls(r.skin_hash))
+        history.append(entry)
+    return {
+        "query": profile.query,
+        "uuid": profile.uuid,
+        "last_seen_at": profile.last_seen_at.isoformat(),
+        "history": history,
+    }
+
+
+def _update_skin_profile_from_sources(
+    uuid: str, current_name: str
+) -> Dict[str, Any]:
+    log.info(
+        f"Updating skin history from sources: uuid={uuid}, current_name={current_name}"
+    )
+
+    rows = gather_remote_skin_rows_by_uuid(uuid, current_name)
+    log.debug(f"Total fetched: {len(rows)} skin entries from all sources")
+
+    current_skin = get_current_skin_from_laby(uuid)
+    if not current_skin:
+        dated_rows = [r for r in rows if r.get("changedAt")]
+        if dated_rows:
+            dated_rows.sort(
+                key=lambda r: parse_timestamp(r.get("changedAt"))
+                or datetime.min.replace(tzinfo=timezone.utc)
+            )
+            latest = dated_rows[-1]
+            current_skin_hash = latest["skin_hash"]
+        elif rows:
+            current_skin_hash = rows[0]["skin_hash"]
+        else:
+            current_skin_hash = ""
+    else:
+        current_skin_hash, _ = current_skin
+
+    if not current_skin_hash:
+        log.warning(f"No current skin found for UUID {uuid}")
+        with tx() as con:
+            ensure_profile(con, uuid, current_name)
+            update_source_timestamp(con, uuid, "skin_scraper")
+            return query_skin_history_public(con, uuid)
+
+    pairs = merge_remote_skin_sources(rows, current_skin_hash)
+    log.info(f"Merged into {len(pairs)} final skin history entries")
+
+    with tx() as con:
+        ensure_profile(con, uuid, current_name)
+        now = datetime.now(timezone.utc)
+
+        existing = set(
+            (
+                r.skin_hash.lower(),
+                r.changed_at if r.changed_at is not None else None,
+            )
+            for r in con.query(SkinHistory).filter_by(uuid=uuid).all()
+        )
+
+        inserted = 0
+        for skin_hash, changed_at, file_hash, slim in pairs:
+            key = (
+                skin_hash.lower(),
+                changed_at if changed_at is not None else None,
+            )
+            if key in existing:
+                continue
+            slim_value = None
+            if slim is True:
+                slim_value = 1
+            elif slim is False:
+                slim_value = 0
+            con.add(
+                SkinHistory(
+                    uuid=uuid,
+                    skin_hash=skin_hash,
+                    file_hash=file_hash,
+                    slim=slim_value,
+                    changed_at=changed_at,
+                    observed_at=now,
+                )
+            )
+            existing.add(key)
+            inserted += 1
+        log.info(
+            f"Inserted {inserted} new skin history rows (preserved existing)."
+        )
+
+        for skin_hash, _, file_hash, _ in pairs:
+            skin_store.prefetch(skin_hash, file_hash)
+
+        update_source_timestamp(con, uuid, "skin_scraper")
+        con.flush()
+        return query_skin_history_public(con, uuid)
+
+
 app = Flask(__name__)
+
+register_skin_routes(app, skin_store)
 
 
 @app.route("/api/namehistory", methods=["GET", "POST", "DELETE"])
@@ -846,6 +1329,206 @@ def api_namehistory():
         log.error(f"Failed to log request: {e}")
 
     return jsonify(response_data)
+
+
+@app.route("/api/skinhistory", methods=["GET", "POST", "DELETE"])
+def api_skinhistory():
+    if request.method == "DELETE":
+        return api_skin_delete()
+
+    username = request.args.get("username", "").strip()
+    uuid_param = request.args.get("uuid", "").strip()
+    source = request.args.get("source")
+    version = request.args.get("version")
+    req_name = request.args.get("req_name")
+    mc_version = request.args.get("mc_version")
+
+    if not username and not uuid_param:
+        return api_skin_docs_html_route()
+
+    uuid = dashed_uuid(uuid_param) if uuid_param else None
+    if not uuid and username:
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,16}", username):
+            abort(400, "username required")
+
+        normalized = normalize_username(username)
+        if normalized:
+            _, uuid = normalized
+        else:
+            with tx() as s:
+                uuid = get_uuid_from_history_by_name(s, username)
+
+    if not uuid:
+        abort(404, "Profile not found")
+
+    current_name = get_profile_by_uuid_from_mojang(uuid)
+    if not current_name:
+        abort(404, "Profile not found")
+
+    force_refresh = request.args.get("refresh", "").lower() in {"1", "true", "yes"}
+    response_data = None
+    with tx() as s:
+        if (
+            not force_refresh
+            and not is_source_stale(s, uuid, "skin_scraper", SCRAPER_STALE_HOURS)
+        ):
+            response_data = query_skin_history_public(s, uuid)
+        else:
+            response_data = _update_skin_profile_from_sources(uuid, current_name)
+
+    ip_address = (
+        request.headers.get("X-Forwarded-For", request.remote_addr or "unknown")
+        .split(",")[0]
+        .strip()
+    )
+    requester_username = req_name.strip() if req_name and req_name.strip() else None
+    requested_username = username or uuid
+
+    try:
+        with tx() as s:
+            log_request(
+                session=s,
+                ip_address=ip_address,
+                requester_username=requester_username,
+                requested_username=requested_username,
+                source=source,
+                version=version,
+                endpoint=request.endpoint or "/api/skinhistory",
+                response_status=200,
+                mc_version=mc_version,
+            )
+    except Exception as e:
+        log.error(f"Failed to log request: {e}")
+
+    return jsonify(response_data)
+
+
+@app.route("/api/skinhistory/delete", methods=["DELETE"])
+@require_auth(AuthLevel.ADMIN)
+def api_skin_delete():
+    username = request.args.get("username", "").strip()
+    uuid_param = request.args.get("uuid", "").strip()
+    source = request.args.get("source")
+    version = request.args.get("version")
+    req_name = request.args.get("req_name")
+    mc_version = request.args.get("mc_version")
+
+    if not username and not uuid_param:
+        abort(400, "username or uuid required")
+
+    uuid = dashed_uuid(uuid_param) if uuid_param else None
+    if not uuid and username:
+        norm = normalize_username(username)
+        if norm:
+            _, uuid = norm
+        else:
+            with tx() as s:
+                uuid = get_uuid_from_history_by_name(s, username)
+
+    if not uuid:
+        abort(404, "Profile not found")
+
+    with tx() as s:
+        profile = s.get(Profile, uuid)
+        if not profile:
+            abort(404, "Profile not found in database")
+        s.query(SkinHistory).filter_by(uuid=uuid).delete()
+        s.query(SourceUpdate).filter_by(uuid=uuid, source="skin_scraper").delete()
+
+    ip_address = (
+        request.headers.get("X-Forwarded-For", request.remote_addr or "unknown")
+        .split(",")[0]
+        .strip()
+    )
+    requester_username = req_name.strip() if req_name and req_name.strip() else (
+        username or None
+    )
+    requested_username = username or uuid
+
+    try:
+        with tx() as s:
+            log_request(
+                session=s,
+                ip_address=ip_address,
+                requester_username=requester_username,
+                requested_username=requested_username,
+                source=source,
+                version=version,
+                endpoint=request.endpoint or "/api/skinhistory/delete",
+                response_status=200,
+                mc_version=mc_version,
+            )
+    except Exception as e:
+        log.error(f"Failed to log request: {e}")
+
+    return jsonify({"message": "Skin history deleted", "uuid": uuid})
+
+
+@app.route("/api/skinhistory/update", methods=["POST"])
+@require_auth(AuthLevel.API)
+def api_skin_update():
+    body = request.get_json(force=True, silent=False) or {}
+    source = request.args.get("source")
+    version = request.args.get("version")
+    req_name = request.args.get("req_name")
+    mc_version = request.args.get("mc_version")
+
+    results = {"updated": [], "errors": []}
+
+    usernames = body.get("usernames", [])
+    if "username" in body:
+        usernames.append(body["username"])
+    uuids = body.get("uuids", [])
+    if "uuid" in body:
+        uuids.append(body["uuid"])
+
+    for name in usernames:
+        norm = normalize_username(name)
+        if not norm:
+            results["errors"].append({"username": name, "error": "Not found"})
+        else:
+            results["updated"].append(
+                _update_skin_profile_from_sources(norm[1], norm[0])
+            )
+            bulk_sleep()
+
+    for u in uuids:
+        u = dashed_uuid(u)
+        name = get_profile_by_uuid_from_mojang(u)
+        if not name:
+            results["errors"].append({"uuid": u, "error": "Not found"})
+        else:
+            results["updated"].append(_update_skin_profile_from_sources(u, name))
+            bulk_sleep()
+
+    ip_address = (
+        request.headers.get("X-Forwarded-For", request.remote_addr or "unknown")
+        .split(",")[0]
+        .strip()
+    )
+    requester_username = req_name.strip() if req_name and req_name.strip() else None
+    requested_username = usernames[0] if usernames else (
+        uuids[0] if uuids else "batch_skin_update"
+    )
+
+    try:
+        with tx() as s:
+            log_request(
+                session=s,
+                ip_address=ip_address,
+                requester_username=requester_username,
+                requested_username=requested_username,
+                source=source,
+                version=version,
+                endpoint=request.endpoint or "/api/skinhistory/update",
+                response_status=200,
+                mc_version=mc_version,
+            )
+    except Exception as e:
+        log.error(f"Failed to log request: {e}")
+
+    return jsonify(results)
+
 
 @app.route("/api/namehistory/delete", methods=["DELETE"])
 @require_auth(AuthLevel.ADMIN)
@@ -1001,7 +1684,7 @@ def get_openapi_spec():
         "info": {
             "title": "Player History API",
             "version": "1.0.0",
-            "description": "An API to track Minecraft player name history.",
+            "description": "An API to track Minecraft player name and skin history.",
         },
         "paths": {
             "/api/namehistory": {
@@ -1093,6 +1776,134 @@ def get_openapi_spec():
                     },
                 }
             },
+            "/api/skinhistory": {
+                "get": {
+                    "summary": "Get skin history by username or UUID",
+                    "parameters": [
+                        {
+                            "name": "username",
+                            "in": "query",
+                            "schema": {"type": "string"},
+                            "description": "The Minecraft username.",
+                        },
+                        {
+                            "name": "uuid",
+                            "in": "query",
+                            "schema": {"type": "string"},
+                            "description": "The player's UUID.",
+                        },
+                    ],
+                    "responses": {
+                        "200": {"description": "Successful response"},
+                        "400": {"description": "Invalid username"},
+                        "404": {"description": "Profile not found"},
+                    },
+                },
+                "post": {
+                    "summary": "Get skin history by username or UUID",
+                    "parameters": [
+                        {
+                            "name": "username",
+                            "in": "query",
+                            "schema": {"type": "string"},
+                            "description": "The Minecraft username.",
+                        },
+                        {
+                            "name": "uuid",
+                            "in": "query",
+                            "schema": {"type": "string"},
+                            "description": "The player's UUID.",
+                        },
+                    ],
+                    "responses": {
+                        "200": {"description": "Successful response"},
+                        "400": {"description": "Invalid username"},
+                        "404": {"description": "Profile not found"},
+                    },
+                },
+                "delete": {
+                    "summary": "Delete cached skin history",
+                    "security": [{"AdminKey": []}],
+                    "parameters": [
+                        {
+                            "name": "username",
+                            "in": "query",
+                            "schema": {"type": "string"},
+                        },
+                        {
+                            "name": "uuid",
+                            "in": "query",
+                            "schema": {"type": "string"},
+                        },
+                    ],
+                    "responses": {
+                        "200": {"description": "Skin history deleted"},
+                        "401": {"description": "Admin authorization required"},
+                        "404": {"description": "Profile not found"},
+                    },
+                },
+            },
+            "/api/skinhistory/update": {
+                "post": {
+                    "summary": "Force-update skin history",
+                    "security": [{"ApiKey": []}],
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "usernames": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                        },
+                                        "uuids": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                        },
+                                    },
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {"description": "Update process completed"},
+                        "401": {"description": "API authorization required"},
+                    },
+                }
+            },
+            "/api/minecraft/player/profile": {
+                "get": {
+                    "summary": "Aggregated player profile across clients",
+                    "parameters": [
+                        {"name": "username", "in": "query", "schema": {"type": "string"}},
+                        {"name": "uuid", "in": "query", "schema": {"type": "string"}},
+                        {
+                            "name": "refresh",
+                            "in": "query",
+                            "schema": {"type": "string"},
+                            "description": "Set to 1/true to bypass cache",
+                        },
+                    ],
+                    "responses": {"200": {"description": "Aggregated profile"}},
+                }
+            },
+            "/api/minecraft/player/{action}": {
+                "get": {
+                    "summary": "Player actions (namehistory, skinhistory, profile/{source}, cosmetics/{source})",
+                    "parameters": [
+                        {
+                            "name": "action",
+                            "in": "path",
+                            "required": True,
+                            "schema": {"type": "string"},
+                        },
+                        {"name": "username", "in": "query", "schema": {"type": "string"}},
+                        {"name": "uuid", "in": "query", "schema": {"type": "string"}},
+                    ],
+                    "responses": {"200": {"description": "Action response"}},
+                }
+            },
         },
         "components": {
             "securitySchemes": {
@@ -1150,9 +1961,28 @@ def get_docs_html(base_url):
         <main class="container">
             <header>
                 <h1>Player History API Documentation</h1>
-                <p>This API allows you to track the name history of Minecraft players.</p>
-                <p>The OpenAPI specification is available at <a href="/api/namehistory/docs.json">/api/namehistory/docs.json</a>.</p>
+                <p>This API allows you to track the name and skin history of Minecraft players.</p>
+                <p>Legacy endpoints remain at <code>/api/namehistory</code> and <code>/api/skinhistory</code>.</p>
+                <p>The new unified API lives under <a href="/api/minecraft/player/">/api/minecraft/player/</a>.</p>
+                <p>The OpenAPI specification is available at <a href="/api/namehistory/docs.json">/api/namehistory/docs.json</a> and <a href="/api/skinhistory/docs.json">/api/skinhistory/docs.json</a>.</p>
             </header>
+
+            <article>
+                <h2><kbd>GET</kbd> /api/minecraft/player/profile</h2>
+                <p>Aggregated profile from LabyMod, Badlion, Hypixel, NameMC, minecraftuuid.com, and more.</p>
+                <p>Returns <code>est_playtime</code>, <code>monthly_views</code>, <code>est_last_online</code>, <code>last_server</code>, and per-source breakdowns.</p>
+                <div class="button-group">
+                    <button onclick="tryIt('mc-profile')">Try It</button>
+                    <button onclick="copyCurl('mc-profile', 'Liforra')">Copy Curl Command</button>
+                </div>
+                <pre id="mc-profile-output" class="try-it-output" style="display:none;"></pre>
+            </article>
+
+            <article>
+                <h2><kbd>GET</kbd> /api/minecraft/player/&lt;action&gt;</h2>
+                <p>Actions: <code>namehistory</code>, <code>skinhistory</code>, <code>profile/labymod</code>, <code>profile/hypixel</code>, <code>cosmetics/labymod</code>, etc.</p>
+                <p>See <a href="/api/minecraft/player/">/api/minecraft/player/</a> for the full list.</p>
+            </article>
 
             <article>
                 <h2><kbd>GET</kbd> /api/namehistory</h2>
@@ -1197,6 +2027,41 @@ def get_docs_html(base_url):
                     <button onclick="copyCurl('delete')">Copy Curl Command</button>
                 </div>
             </article>
+
+            <article>
+                <h2><kbd>GET</kbd> /api/skinhistory</h2>
+                <p>Retrieves the skin history for a given Minecraft username or UUID.</p>
+                <h4>Parameters</h4>
+                <ul>
+                    <li><code>username</code> (query): The Minecraft username.</li>
+                    <li><code>uuid</code> (query): The player's UUID.</li>
+                </ul>
+                <div class="button-group">
+                    <button onclick="tryIt('skin-get')">Try It with username</button>
+                    <button onclick="copyCurl('skin-get', 'Dream')">Copy Curl Command (username)</button>
+                </div>
+                <div class="button-group" style="margin-top: 1rem;">
+                    <button onclick="tryIt('skin-uuid')">Try It with UUID</button>
+                    <button onclick="copyCurl('skin-uuid', 'ec70bcaf-702f-4bb8-b48d-276fa52a780c')">Copy Curl Command (UUID)</button>
+                </div>
+                <pre id="skin-get-output" class="try-it-output" style="display:none;"></pre>
+            </article>
+
+            <article>
+                <h2><kbd>POST</kbd> /api/skinhistory/update {'<small>Requires API Key</small>' if api_key_required else ''}</h2>
+                <p>Forces an immediate skin history update for one or more player profiles.</p>
+                <div class="button-group">
+                    <button onclick="copyCurl('skin-update')">Copy Curl Command</button>
+                </div>
+            </article>
+
+            <article>
+                <h2><kbd>DELETE</kbd> /api/skinhistory/delete</h2>
+                <p>Deletes cached skin history for a player without removing their name history.</p>
+                <div class="button-group">
+                    <button onclick="copyCurl('skin-delete')">Copy Curl Command</button>
+                </div>
+            </article>
         </main>
         <script>
             function getBaseUrl() {{
@@ -1215,9 +2080,22 @@ def get_docs_html(base_url):
                     param = prompt("Enter a UUID", "069a79f4-44e9-4726-a5be-fca90e38aaf5");
                     if (!param) return;
                     url = `${{baseUrl}}api/namehistory?uuid=${{param}}`;
+                }} else if (type === 'skin-get') {{
+                    param = prompt("Enter a username", "Dream");
+                    if (!param) return;
+                    url = `${{baseUrl}}api/skinhistory?username=${{param}}`;
+                }} else if (type === 'skin-uuid') {{
+                    param = prompt("Enter a UUID", "ec70bcaf-702f-4bb8-b48d-276fa52a780c");
+                    if (!param) return;
+                    url = `${{baseUrl}}api/skinhistory?uuid=${{param}}`;
+                }} else if (type === 'mc-profile') {{
+                    param = prompt("Enter a username", "Liforra");
+                    if (!param) return;
+                    url = `${{baseUrl}}api/minecraft/player/profile?username=${{param}}`;
                 }}
 
-                const output = document.getElementById('get-output');
+                const outputId = type === 'mc-profile' ? 'mc-profile-output' : (type.startsWith('skin') ? 'skin-get-output' : 'get-output');
+                const output = document.getElementById(outputId);
                 output.style.display = 'block';
                 output.textContent = `Fetching: ${{url}}\n\n`;
 
@@ -1242,6 +2120,16 @@ def get_docs_html(base_url):
                     command = `curl -X POST -H "Content-Type: application/json" {'-H "Authorization: API-Key YOUR_API_KEY" ' if api_key_required else ''}-d '{{"usernames": ["Notch"]}}' "${{baseUrl}}api/namehistory/update"`;
                 }} else if (type === 'delete') {{
                     command = `curl -X DELETE {'-H "Authorization: Admin-Key YOUR_ADMIN_KEY" ' if admin_key_required else ''}"${{baseUrl}}api/namehistory/delete?username=Notch"`;
+                }} else if (type === 'skin-get') {{
+                    command = `curl "${{baseUrl}}api/skinhistory?username=${{param}}"`;
+                }} else if (type === 'skin-uuid') {{
+                    command = `curl "${{baseUrl}}api/skinhistory?uuid=${{param}}"`;
+                }} else if (type === 'skin-update') {{
+                    command = `curl -X POST -H "Content-Type: application/json" {'-H "Authorization: API-Key YOUR_API_KEY" ' if api_key_required else ''}-d '{{"usernames": ["Dream"]}}' "${{baseUrl}}api/skinhistory/update"`;
+                }} else if (type === 'skin-delete') {{
+                    command = `curl -X DELETE {'-H "Authorization: Admin-Key YOUR_ADMIN_KEY" ' if admin_key_required else ''}"${{baseUrl}}api/skinhistory/delete?username=Dream"`;
+                }} else if (type === 'mc-profile') {{
+                    command = `curl "${{baseUrl}}api/minecraft/player/profile?username=${{param}}"`;
                 }}
 
                 navigator.clipboard.writeText(command).then(() => {{
@@ -1252,6 +2140,17 @@ def get_docs_html(base_url):
     </body>
     </html>
     """
+
+@app.route("/api/skinhistory/docs.json", methods=["GET"])
+def api_skin_docs_json():
+    return jsonify(get_openapi_spec())
+
+
+@app.route("/api/skinhistory/", methods=["GET"])
+def api_skin_docs_html_route():
+    base_url = request.host_url
+    return get_docs_html(base_url)
+
 
 @app.route("/api/namehistory/docs.json", methods=["GET"])
 def api_docs_json():
@@ -1328,6 +2227,80 @@ def log_request(session, ip_address, requester_username, requested_username, sou
         session.add(request_log)
     except Exception as e:
         log.error(f"Failed to log request: {e}")
+
+
+try:
+    Base.metadata.create_all(bind=engine)
+    with tx() as session:
+        load_tokens_from_db(session, ChallengeToken, challenge_store)
+except Exception as exc:
+    log.warning("Challenge token DB load skipped: %s", exc)
+
+register_minecraft_routes(
+    app,
+    {
+        "ClientProfileSnapshot": ClientProfileSnapshot,
+        "ClientCosmeticSnapshot": ClientCosmeticSnapshot,
+        "tx": tx,
+        "ensure_profile": ensure_profile,
+        "is_source_stale": is_source_stale,
+        "update_source_timestamp": update_source_timestamp,
+        "resolve_player": resolve_player,
+        "log_request": log_request,
+        "query_history_public": query_history_public,
+        "query_skin_history_public": query_skin_history_public,
+        "_update_profile_from_sources": _update_profile_from_sources,
+        "_update_skin_profile_from_sources": _update_skin_profile_from_sources,
+        "get_profile_by_uuid_from_mojang": get_profile_by_uuid_from_mojang,
+        "SCRAPER_STALE_HOURS": SCRAPER_STALE_HOURS,
+        "jitter_sleep": jitter_sleep,
+        "log": log,
+        "check_api_auth": check_api_auth,
+        "provider_ctx": {
+            "scraper_session": scraper_session,
+            "mojang_session": mojang_session,
+            "fetch_profile_html": fetch_profile_html,
+            "hypixel_api_key": HYPIXEL_API_KEY,
+            "challenge_store": challenge_store,
+            "laby_challenge_header": LABY_CHALLENGE_HEADER,
+            "laby_challenge_token": LABY_CHALLENGE_TOKEN,
+            "sync_challenge_tokens": sync_challenge_tokens,
+            "invalidate_challenge_token": invalidate_challenge_token,
+        },
+    },
+)
+
+register_captcha_routes(
+    app,
+    {
+        "challenge_store": challenge_store,
+        "tx": tx,
+        "ChallengeToken": ChallengeToken,
+        "persist_challenge_token": lambda session, provider, source: persist_token_to_db(
+            session, ChallengeToken, challenge_store, provider, source
+        ),
+        "load_challenge_tokens": lambda session: load_tokens_from_db(
+            session, ChallengeToken, challenge_store
+        ),
+        "ADMIN_KEY": ADMIN_KEY,
+        "LABY_TURNSTILE_SITE_KEY": LABY_TURNSTILE_SITE_KEY,
+        "CHALLENGE_TTL_MINUTES": CHALLENGE_TTL_MINUTES,
+        "scraper_session": scraper_session,
+        "log": log,
+    },
+)
+
+
+register_votes_routes(
+    app,
+    {
+        "resolve_player": resolve_player,
+        "log_request": log_request,
+        "tx": tx,
+        "votes_config": VOTES_CONFIG,
+        "log": log,
+    },
+)
 
 
 # --- MAIN ---

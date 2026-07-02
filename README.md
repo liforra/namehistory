@@ -33,12 +33,43 @@ Main Repository on [Codeberg](https://codeberg.org/liforra/namehistory), read-on
 
 ## API Endpoints
 
-- `GET /api/namehistory?username=<name>`: Get name history by username
-- `GET /api/namehistory/uuid/<uuid>`: Get name history by UUID
-- `POST /api/namehistory/update`: Update one or more profiles (by username or UUID)
-- `POST /api/namehistory/refresh-all`: Schedule a refresh for all cached profiles
+### Legacy (unchanged)
 
-### Endpoint Details
+- `GET /api/namehistory?username=<name>`: Get name history by username
+- `GET /api/skinhistory?username=<name>`: Get skin history by username
+- `POST /api/namehistory/update`: Update one or more profiles (by username or UUID)
+- `POST /api/skinhistory/update`: Update skin history for one or more profiles
+
+### Unified Minecraft API
+
+Base: `/api/minecraft/player/<action>?username=<name>` or `?uuid=<uuid>`
+
+- `GET /api/minecraft/player/profile` — aggregated profile (`est_playtime`, `monthly_views`, `est_last_online`, `last_server`, per-source breakdown)
+- `GET /api/minecraft/player/namehistory` — name history
+- `GET /api/minecraft/player/skinhistory` — skin history
+- `POST /api/minecraft/player/update` — force refresh profile, name, and skin data
+- `GET /api/minecraft/player/profile/<source>` — labymod, badlion, hypixel, minecraftuuid, namemc, mineplex
+- `GET /api/minecraft/player/cosmetics/<source>` — labymod, badlion, essentials, lunar
+- `GET /api/minecraft/player/votes` — check configured servers for votes/likes across listing sites
+- `GET /api/minecraft/player/votes/<site>` — namemc, minecraft_mp, topgservers, etc.
+
+Discovery: `GET /api/minecraft/player/`
+
+**Provider challenge (LabyMod views/month):** Some LabyMod v3 endpoints need a Cloudflare Turnstile token. Prefer solving once via the web UI rather than hardcoding tokens:
+
+- `GET /api/minecraft/captcha` — solve Turnstile or paste a token (stored for all requests until expiry)
+- `GET /api/minecraft/captcha/status` — JSON status
+- `POST /api/minecraft/captcha` — `{"provider":"labymod","token":"..."}`
+- `GET /api/minecraft/admin-login` — admin form (requires `NAMEHISTORY_ADMIN_KEY` when set)
+- `POST /api/minecraft/admin-login` — same with `Authorization: Admin-Key ...`
+
+Optional config/env: `LABY_CHALLENGE_TOKEN`, `LABY_TURNSTILE_SITE_KEY`, `CHALLENGE_TTL_MINUTES` (default 45).
+
+**Vote sites:** Listing sites do not publish a full per-player vote history. Configure servers under `[votes.servers]` in `config.toml` — NameMC likes work without keys; Minecraft-MP, TopGServers, etc. need each server's API key from that site's dashboard.
+
+Add `&refresh=1` to bypass cache on profile endpoints.
+
+### Legacy detail endpoints
 
 - **GET /api/namehistory?username=USERNAME**
   - Returns the name history for a given username. If the username is not current, but exists in the cache, it will attempt to resolve the new name and return the updated history.
@@ -96,7 +127,15 @@ batch_size = 10
    ```bash
    pip install -r requirements.txt
    ```
-2. **(Optional) Create and edit `config.toml`**
+2. **Configure secrets for local development:**
+   ```bash
+   cp .env.example .env
+   # Edit .env and set HYPIXEL_API_KEY=your-key-here
+   ```
+   Configuration priority: defaults → `config.toml` → `config.local.toml` → `.env` → environment variables.
+
+   Supported env vars include `HYPIXEL_API_KEY`, `LABY_CHALLENGE_TOKEN`, `LABY_TURNSTILE_SITE_KEY`, `NAMEHISTORY_API_KEY`, `NAMEHISTORY_ADMIN_KEY`, `NAMEHISTORY_PORT`, and `NAMEHISTORY_DB_PATH`.
+3. **(Optional) Create and edit `config.toml`**
 3. **Set up your database backend:**
    - For SQLite (default): no extra setup needed
    - For MySQL/MariaDB: ensure the database exists and the user has permissions
@@ -109,9 +148,13 @@ batch_size = 10
    ```bash
    python main.py clean
    ```
-6. **(Optional) Debug mode (download raw HTML/API data):**
+6. **Run local smoke test:**
    ```bash
-   python main.py --dump-html <username>
+   python scripts/test_local.py Liforra
+   ```
+7. **(Optional) Migrate existing database after upgrades:**
+   ```bash
+   python migrate.py
    ```
 
 ## Database

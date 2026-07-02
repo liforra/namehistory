@@ -95,8 +95,13 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
-# Environments
+# Local overrides (gitignored)
+config.local.toml
 .env
+
+# Database
+namehistory.db
+skin_cache/
 .venv
 env/
 venv/

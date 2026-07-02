@@ -34,3 +34,46 @@ check_interval_minutes = 60
 mojang_stale_hours = 6
 scraper_stale_hours = 24
 batch_size = 10
+
+[skins]
+# Downloaded skin textures and generated head previews (permanent local cache).
+cache_dir = "skin_cache"
+
+[providers]
+# Hypixel API key — prefer HYPIXEL_API_KEY in .env (see .env.example)
+hypixel_api_key = ""
+
+# LabyMod v3 challenge (Turnstile) — optional; use /api/minecraft/captcha if unset
+# laby_turnstile_site_key = ""
+# laby_challenge_token = ""
+# laby_challenge_header = "X-Challenge-Token"
+# challenge_ttl_minutes = 45
+
+[votes]
+# Vote sites only support per-server checks (not a global player vote history).
+# NameMC checks server likes (no API key). Others need each server's listing API key.
+
+[votes.sites]
+namemc = true
+minecraft_mp = true
+minecraftpocket_servers = true
+trustmyserver = true
+topgservers = true
+
+[[votes.servers]]
+id = "hypixel"
+name = "Hypixel"
+address = "mc.hypixel.net"
+namemc = true
+# minecraft_mp_key = "your-server-key-from-minecraft-mp.com"
+# topgservers_key = "tgs_your_key"
+
+# [[votes.servers]]
+# id = "my-server"
+# name = "My Server"
+# address = "play.example.com"
+# namemc = true
+# minecraft_mp_key = ""
+# minecraftpocket_servers_key = ""
+# trustmyserver_key = ""
+# topgservers_key = ""
