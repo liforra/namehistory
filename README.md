@@ -125,8 +125,9 @@ batch_size = 10
 
 1. **Install dependencies:**
    ```bash
-   pip install -r requirements.txt
+   uv sync
    ```
+   This reads `pyproject.toml`/`uv.lock` and creates a `.venv` automatically. Prefix subsequent commands with `uv run` (e.g. `uv run python main.py`), or activate the venv yourself.
 2. **Configure secrets for local development:**
    ```bash
    cp .env.example .env
@@ -142,19 +143,19 @@ batch_size = 10
    - For PostgreSQL: ensure the database exists and the user has permissions
 4. **Initialize the database and start the server:**
    ```bash
-   python main.py
+   uv run python main.py
    ```
 5. **(Optional) Clean the database:**
    ```bash
-   python main.py clean
+   uv run python main.py clean
    ```
 6. **Run local smoke test:**
    ```bash
-   python scripts/test_local.py Liforra
+   uv run python scripts/test_local.py Liforra
    ```
 7. **(Optional) Migrate existing database after upgrades:**
    ```bash
-   python migrate.py
+   uv run python migrate.py
    ```
 
 ## Database

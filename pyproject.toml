@@ -4,4 +4,15 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "beautifulsoup4==4.12.3",
+    "curl-cffi==0.6.4",
+    "Flask==3.0.3",
+    "Pillow==11.2.1",
+    "psycopg2-binary==2.9.12",
+    "PyMySQL==1.1.0",
+    "python-dateutil==2.9.0",
+    "requests==2.32.3",
+    "SQLAlchemy==2.0.51",
+    "tomli==2.0.1",
+]
