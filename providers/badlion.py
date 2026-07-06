@@ -123,6 +123,13 @@ def fetch_badlion_profile(
 def fetch_badlion_cosmetics(
     uuid: str, username: str, scraper_session: Any
 ) -> CosmeticsSnapshot:
+    """
+    Badlion's `__NEXT_DATA__` `card` object has no cosmetics/ownedCosmetics
+    field — that was never real. The actual per-player cosmetic-adjacent data
+    Badlion publishes is `badges` (earned achievement badges) and `ranks`
+    (forum/staff ranks); skins are handled by the dedicated skin-history
+    feature, not duplicated here.
+    """
     source = "badlion"
     url = f"https://www.badlion.net/profile/minecraft/{username}/"
     try:
@@ -134,33 +141,32 @@ def fetch_badlion_cosmetics(
                 error=f"Badlion HTTP {r.status_code if r else 'no response'}",
             )
         page_props = _parse_next_data(r.text).get("props", {}).get("pageProps", {})
-        parsed = _parse_badlion_page_props(page_props)
-        skins = parsed.get("skins") or []
-        cosmetics = page_props.get("cosmetics") or page_props.get("ownedCosmetics") or []
-        items = cosmetics if isinstance(cosmetics, list) else []
-        if skins:
-            items = items + [
-                {
-                    "type": "skin",
-                    "name": s.get("name"),
-                    "skin_hash": s.get("skin_hash"),
-                    "skin_url": s.get("skin_url"),
-                    "hidden": s.get("hidden"),
-                }
-                for s in skins
-                if isinstance(s, dict)
-            ]
-        if items:
+        card = page_props.get("card") or {}
+        if not card.get("found") and not card.get("success"):
             return CosmeticsSnapshot(
-                source=source,
-                available=True,
-                cosmetics=items,
-                raw={"skins": skins, "cosmetics": cosmetics},
+                source=source, available=False, error="No Badlion profile found"
             )
+
+        badges = card.get("badges") or []
+        ranks = card.get("ranks") or []
+
+        items = [
+            {"type": "badge", "name": b.get("name") if isinstance(b, dict) else str(b)}
+            for b in badges
+        ] + [
+            {
+                "type": "rank",
+                "name": rk.get("name") if isinstance(rk, dict) else str(rk),
+                "color": rk.get("color") if isinstance(rk, dict) else None,
+            }
+            for rk in ranks
+        ]
+
         return CosmeticsSnapshot(
             source=source,
-            available=False,
-            error="No cosmetics data found on Badlion profile",
+            available=True,
+            cosmetics=items,
+            raw={"badges": badges, "ranks": ranks},
         )
     except Exception as exc:
         return CosmeticsSnapshot(source=source, available=False, error=str(exc))

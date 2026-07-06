@@ -74,6 +74,14 @@ def skin_public_urls(skin_hash: str, size: int = 32) -> dict[str, str]:
     }
 
 
+def cape_public_urls(cape_hash: str, kind: str = "cape") -> dict[str, str]:
+    h = cape_hash.strip().lower()
+    return {
+        "front_url": f"/api/minecraft/{kind}/{h}/front.png",
+        "flat_url": f"/api/minecraft/{kind}/{h}/flat.png",
+    }
+
+
 def _is_image_response(content_type: str, body: bytes) -> bool:
     ct = (content_type or "").lower()
     if "image" in ct:
@@ -185,6 +193,83 @@ class SkinAssetStore:
         except Exception as exc:
             log.warning("skin prefetch failed for %s: %s", skin_hash, exc)
             return False
+
+
+CAPE_KINDS = {"cape": "capeFront.png", "cloak": "cloakFront.png"}
+CAPE_VARIANTS = {"front": None, "flat": "skin.png"}  # front URL depends on kind
+
+
+class CapeAssetStore:
+    """
+    Capes/cloaks have a completely different texture layout than player skins
+    (no head/body regions to crop), so they need their own renderer rather
+    than reusing SkinAssetStore's head-crop pipeline. Laby's texture API
+    pre-renders a "front" view (how the garment actually looks worn) which is
+    what a UI thumbnail wants; "flat" is the raw unfolded texture sheet. Only
+    Laby (MD5-style hash) garments are supported — this project has no other
+    cape/cloak source.
+    """
+
+    def __init__(self, cache_dir: Path, fetcher: Callable[..., Any]):
+        self.cache_dir = cache_dir
+        self.fetcher = fetcher
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _asset_path(self, cape_hash: str, kind: str, variant: str) -> Path:
+        h = cape_hash.strip().lower()
+        return self.cache_dir / "capes" / h[:2] / f"{h}_{kind}_{variant}.png"
+
+    def ensure(self, cape_hash: str, kind: str = "cape", variant: str = "front") -> Path:
+        h = cape_hash.strip().lower()
+        if not SKIN_HASH_RE.fullmatch(h):
+            raise ValueError("invalid cape hash")
+        if kind not in CAPE_KINDS or variant not in CAPE_VARIANTS:
+            raise ValueError("invalid cape kind/variant")
+
+        path = self._asset_path(h, kind, variant)
+        if path.is_file():
+            return path
+
+        remote_name = CAPE_VARIANTS[variant] or CAPE_KINDS[kind]
+        url = f"https://laby.net/api/v3/texture/{h}/{remote_name}"
+        try:
+            response = self.fetcher(url, timeout=15, allow_redirects=True)
+            if response is None or response.status_code != 200:
+                raise RuntimeError(f"HTTP {response.status_code if response else 'no response'}")
+            body = response.content
+            if not body or not _is_image_response(
+                response.headers.get("content-type", ""), body
+            ):
+                raise RuntimeError("non-image response")
+            image = Image.open(io.BytesIO(body)).convert("RGBA")
+            out = io.BytesIO()
+            image.save(out, format="PNG")
+            _atomic_write(path, out.getvalue())
+        except Exception as exc:
+            raise RuntimeError(f"could not download {kind} {h} ({variant}): {exc}") from exc
+
+        log.info("cached %s texture %s/%s (%d bytes)", kind, h, variant, path.stat().st_size)
+        return path
+
+
+def register_cape_routes(app, store: CapeAssetStore) -> None:
+    @app.route("/api/minecraft/<kind>/<cape_hash>/<variant>.png", methods=["GET"])
+    def cape_asset(kind: str, cape_hash: str, variant: str):
+        if kind not in CAPE_KINDS:
+            abort(404, "unknown garment kind")
+        h = cape_hash.strip().lower()
+        if not SKIN_HASH_RE.fullmatch(h):
+            abort(400, "invalid cape hash")
+        if variant not in CAPE_VARIANTS:
+            abort(404, "unknown cape variant")
+        try:
+            path = store.ensure(h, kind, variant)
+        except Exception:
+            abort(404, "cape texture not available")
+        response = send_file(path, mimetype="image/png", conditional=True)
+        response.cache_control.max_age = 31536000
+        response.cache_control.public = True
+        return response
 
 
 def register_skin_routes(app, store: SkinAssetStore) -> None:

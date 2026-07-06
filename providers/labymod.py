@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from providers.base import CosmeticsSnapshot, SourceSnapshot
 from providers.laby_challenge import laby_v3_get
+from skin_assets import cape_public_urls
 
 
 def _parse_ts(value: Optional[str]) -> Optional[datetime]:
@@ -194,23 +195,36 @@ def fetch_labymod_cosmetics(
                 }
             )
         for cape in textures.get("CAPE", []):
-            cosmetics.append(
-                {
-                    "type": "cape",
-                    "hash": cape.get("image_hash"),
-                    "file_hash": cape.get("file_hash"),
-                    "first_seen_at": cape.get("first_seen_at"),
-                    "last_seen_at": cape.get("last_seen_at"),
-                }
-            )
+            item = {
+                "type": "cape",
+                "hash": cape.get("image_hash"),
+                "file_hash": cape.get("file_hash"),
+                "first_seen_at": cape.get("first_seen_at"),
+                "last_seen_at": cape.get("last_seen_at"),
+            }
+            if item["hash"]:
+                item.update(cape_public_urls(item["hash"], "cape"))
+            cosmetics.append(item)
         for cloak in textures.get("CLOAK", []):
+            item = {
+                "type": "cloak",
+                "hash": cloak.get("image_hash"),
+                "file_hash": cloak.get("file_hash"),
+                "first_seen_at": cloak.get("first_seen_at"),
+                "last_seen_at": cloak.get("last_seen_at"),
+            }
+            if item["hash"]:
+                item.update(cape_public_urls(item["hash"], "cloak"))
+            cosmetics.append(item)
+        for bandana in textures.get("BANDANA", []):
             cosmetics.append(
                 {
-                    "type": "cloak",
-                    "hash": cloak.get("image_hash"),
-                    "file_hash": cloak.get("file_hash"),
-                    "first_seen_at": cloak.get("first_seen_at"),
-                    "last_seen_at": cloak.get("last_seen_at"),
+                    "type": "bandana",
+                    "hash": bandana.get("image_hash"),
+                    "file_hash": bandana.get("file_hash"),
+                    "active": bandana.get("active"),
+                    "first_seen_at": bandana.get("first_seen_at"),
+                    "last_seen_at": bandana.get("last_seen_at"),
                 }
             )
         return CosmeticsSnapshot(

@@ -16,6 +16,13 @@ from providers.registry import (
     fetch_profile_source,
 )
 from providers.base import CosmeticsSnapshot, SourceSnapshot
+from providers.laby_textures import (
+    VALID_TEXTURE_TYPES,
+    fetch_cape_leaderboard_lookup,
+    fetch_texture_meta,
+    fetch_texture_tags,
+    fetch_texture_users,
+)
 
 
 def client_profile_models(Base):
@@ -365,6 +372,15 @@ def register_minecraft_routes(app, deps: Dict[str, Any]) -> None:
     @app.route("/api/minecraft/<entity>", methods=["GET"])
     @app.route("/api/minecraft/<entity>/", methods=["GET"])
     def minecraft_entity_docs(entity: str):
+        if entity == "texture":
+            return jsonify(
+                {
+                    "entity": entity,
+                    "texture_types": sorted(VALID_TEXTURE_TYPES),
+                    "actions": ["<type>/<hash>/meta", "<type>/<hash>/users", "<type>/<hash>/tags"],
+                    "example": "/api/minecraft/texture/cape/5b37a01fde6a3e075f3bc5694c18e667/meta",
+                }
+            )
         if entity != "player":
             abort(404, description=f"Unsupported entity type: {entity}")
         return jsonify(
@@ -376,6 +392,7 @@ def register_minecraft_routes(app, deps: Dict[str, Any]) -> None:
                     "skinhistory",
                     "update",
                     "votes",
+                    "cape-rank",
                     "profile/<source>",
                     "cosmetics/<source>",
                     "votes/<site>",
@@ -392,6 +409,30 @@ def register_minecraft_routes(app, deps: Dict[str, Any]) -> None:
 
     @app.route("/api/minecraft/<entity>/<path:action>", methods=["GET", "POST"])
     def minecraft_api(entity: str, action: str):
+        if entity == "texture":
+            parts = action.split("/")
+            if len(parts) != 3:
+                abort(404, description="Expected /api/minecraft/texture/<type>/<hash>/<meta|users|tags>")
+            ttype, texture_hash, sub = parts
+            if ttype.lower() not in VALID_TEXTURE_TYPES:
+                abort(404, description=f"Unknown texture type: {ttype}")
+            fetchers = {
+                "meta": fetch_texture_meta,
+                "users": fetch_texture_users,
+                "tags": fetch_texture_tags,
+            }
+            fetcher = fetchers.get(sub)
+            if not fetcher:
+                abort(404, description=f"Unknown texture action: {sub}")
+            data, status, err = fetcher(
+                texture_hash, ttype, provider_ctx.get("scraper_session")
+            )
+            if data is None:
+                return jsonify({"error": err or "Unknown error"}), status if status else 502
+            return jsonify(
+                {"type": ttype.lower(), "hash": texture_hash.lower(), **data}
+            )
+
         if entity != "player":
             abort(404, description=f"Unsupported entity type: {entity}")
 
@@ -433,6 +474,25 @@ def register_minecraft_routes(app, deps: Dict[str, Any]) -> None:
             data = _player_skinhistory(uuid, display_name, force=force)
             _log_hit(request.endpoint or action, username or uuid)
             return jsonify(data)
+
+        if action == "cape-rank":
+            data, status, err = fetch_cape_leaderboard_lookup(
+                display_name, provider_ctx.get("scraper_session"), provider_ctx
+            )
+            _log_hit(request.endpoint or action, username or uuid)
+            if data is None:
+                return jsonify(
+                    {
+                        "query": display_name,
+                        "uuid": uuid,
+                        "available": False,
+                        "error": err or "Unknown error",
+                        "needs_challenge": status == 428,
+                    }
+                )
+            return jsonify(
+                {"query": display_name, "uuid": uuid, "available": True, **data}
+            )
 
         if action == "update":
             if request.method != "POST":

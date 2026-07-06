@@ -137,23 +137,23 @@ batch_size = 10
 
    Supported env vars include `HYPIXEL_API_KEY`, `LABY_CHALLENGE_TOKEN`, `LABY_TURNSTILE_SITE_KEY`, `NAMEHISTORY_API_KEY`, `NAMEHISTORY_ADMIN_KEY`, `NAMEHISTORY_PORT`, and `NAMEHISTORY_DB_PATH`.
 3. **(Optional) Create and edit `config.toml`**
-3. **Set up your database backend:**
+4. **Set up your database backend:**
    - For SQLite (default): no extra setup needed
    - For MySQL/MariaDB: ensure the database exists and the user has permissions
    - For PostgreSQL: ensure the database exists and the user has permissions
-4. **Initialize the database and start the server:**
+5. **Initialize the database and start the server:**
    ```bash
    uv run python main.py
    ```
-5. **(Optional) Clean the database:**
+6. **(Optional) Clean the database:**
    ```bash
    uv run python main.py clean
    ```
-6. **Run local smoke test:**
+7. **Run local smoke test:**
    ```bash
    uv run python scripts/test_local.py Liforra
    ```
-7. **(Optional) Migrate existing database after upgrades:**
+8. **(Optional) Migrate existing database after upgrades:**
    ```bash
    uv run python migrate.py
    ```
@@ -173,15 +173,18 @@ batch_size = 10
 
 ## Dependencies
 
-- Python 3.7+
+- Python 3.14+ (pinned in `.python-version`; [uv](https://docs.astral.sh/uv/) installs it automatically)
 - Flask
 - requests
-- curl_cffi
+- curl_cffi (browser-impersonated scraping)
 - beautifulsoup4
-- tomli (for TOML config)
-- SQLAlchemy (for multi-database support)
-- PyMySQL (for MySQL/MariaDB)
-- psycopg2-binary (for PostgreSQL)
+- Pillow (skin rendering)
+- python-dateutil
+- SQLAlchemy (multi-database support)
+- PyMySQL (MySQL/MariaDB)
+- psycopg2-binary (PostgreSQL)
+
+Exact versions are locked in `uv.lock`; `uv sync` installs everything.
 
 ## Legal Notice
 

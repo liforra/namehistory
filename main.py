@@ -6,12 +6,13 @@ import re
 import time
 import json
 import random
+import hashlib
 import threading
 import argparse
 from pathlib import Path
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from collections import defaultdict
 from dateutil import parser as dateutil_parser
 
@@ -47,12 +48,13 @@ from challenge_store import (
 )
 from captcha_routes import register_captcha_routes
 from votes_api import register_votes_routes
-from skin_assets import SkinAssetStore, register_skin_routes, skin_public_urls
-
-try:
-    import tomli as toml  # noqa: F401 — used by config_loader
-except ImportError:
-    toml = None
+from skin_assets import (
+    CapeAssetStore,
+    SkinAssetStore,
+    register_cape_routes,
+    register_skin_routes,
+    skin_public_urls,
+)
 
 import logging
 from logging.handlers import RotatingFileHandler
@@ -66,6 +68,12 @@ DB_TYPE = CONFIG["database"].get("type", "sqlite")
 DB_PATH = CONFIG["database"].get("path", "namehistory.db")
 DB_URL = CONFIG["database"].get("url", None)
 DEFAULT_SLEEP = float(CONFIG["fetch"]["default_sleep"])
+# Same-name entries whose timestamps differ by less than this are treated as
+# the same change event reported with different clocks (sources disagree by
+# minutes to weeks). Mojang enforces 30 days between changes and ~37 days
+# before a dropped name is reusable, so any window below 30 days cannot
+# swallow a genuine reuse.
+FUZZY_WINDOW_DAYS = float(CONFIG["fetch"].get("fuzzy_window_days", 1))
 BULK_MIN_DELAY = float(CONFIG["fetch"]["bulk_min_delay"])
 BULK_MAX_DELAY = float(CONFIG["fetch"]["bulk_max_delay"])
 RATE_LIMIT_RPM = int(CONFIG["rate_limit"]["rpm"])
@@ -229,6 +237,27 @@ skin_store = SkinAssetStore(
     Path(SKIN_CACHE_DIR),
     lambda url, **kwargs: scraper_session.get(url, **kwargs),
 )
+cape_store = CapeAssetStore(
+    Path(SKIN_CACHE_DIR),
+    lambda url, **kwargs: scraper_session.get(url, **kwargs),
+)
+
+
+def resolve_skin_content_key(
+    skin_hash: str, file_hash: Optional[str] = None
+) -> Optional[str]:
+    """
+    SHA256 of the decoded, normalized texture — a stable identity across
+    sources that use incompatible hash schemes for the same pixels (Laby's
+    MD5-style hash vs NameMC's opaque id). Backed by skin_store's on-disk
+    cache, so repeat calls for an already-prefetched hash are local reads,
+    not new downloads.
+    """
+    try:
+        path = skin_store.ensure_skin(skin_hash, file_hash)
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except Exception:
+        return None
 mojang_session = requests.Session()
 MCS_LOOKUP = (
     "https://api.minecraftservices.com/minecraft/profile/lookup/name/{name}"
@@ -255,11 +284,20 @@ def dashed_uuid(raw: str) -> str:
 
 
 def parse_timestamp(ts: Optional[str]) -> Optional[datetime]:
-    """Parse a timestamp string to datetime object, return None if invalid or None."""
-    if not ts:
+    """Parse a timestamp (ISO string or epoch seconds/millis) to an aware UTC
+    datetime, return None if invalid or None."""
+    if ts is None or ts == "":
         return None
     try:
-        return dateutil_parser.isoparse(ts).replace(tzinfo=timezone.utc)
+        if isinstance(ts, (int, float)) or str(ts).strip().isdigit():
+            value = float(ts)
+            if value >= 1e12:  # epoch milliseconds
+                value /= 1000.0
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        dt = dateutil_parser.isoparse(str(ts))
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
     except Exception:
         return None
 
@@ -494,9 +532,42 @@ def fetch_laby_api_data(uuid: str) -> List[Dict[str, Optional[str]]]:
                 "name": e.get("name"),
                 "changedAt": e.get("changed_at"),
                 "source": "laby",
+                # Laby marks approximated change dates with accurate=false;
+                # those can be weeks off the real event.
+                "accurate": bool(e.get("accurate", True)),
             }
             for e in r.json()
             if e.get("name")
+        ]
+    except Exception:
+        return []
+
+
+def fetch_crafty_name_data(username: str) -> List[Dict[str, Optional[str]]]:
+    """
+    Crafty.gg (crafty.gg/players/{username}.json) sometimes has a real
+    changed_at for the very first name on an account, which Mojang never
+    exposed and Laby/NameMC often report as null — useful to fill that gap.
+    """
+    try:
+        r = scraper_session.get(
+            f"https://crafty.gg/players/{username}.json",
+            headers={"Accept": "application/json"},
+            timeout=12,
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        if not isinstance(data, dict):
+            return []
+        return [
+            {
+                "name": e.get("username"),
+                "changedAt": e.get("changed_at"),
+                "source": "crafty",
+            }
+            for e in data.get("usernames") or []
+            if isinstance(e, dict) and e.get("username")
         ]
     except Exception:
         return []
@@ -506,7 +577,7 @@ def gather_remote_rows_by_uuid(
     uuid: str, current_name: str
 ) -> List[Dict[str, Optional[str]]]:
     """
-    Fetch from BOTH Laby and NameMC, return all results.
+    Fetch from Laby, NameMC, and Crafty.gg, return all results.
     """
     all_rows = []
 
@@ -522,6 +593,14 @@ def gather_remote_rows_by_uuid(
     namemc_rows = fetch_namemc_data(current_name)
     log.debug(f"NameMC returned {len(namemc_rows)} entries")
     all_rows.extend(namemc_rows)
+    jitter_sleep()
+
+    # Fetch from Crafty.gg — mainly useful for filling in the original
+    # name's date, which Laby/NameMC frequently report as null.
+    log.debug(f"Fetching from Crafty.gg for username {current_name}")
+    crafty_rows = fetch_crafty_name_data(current_name)
+    log.debug(f"Crafty.gg returned {len(crafty_rows)} entries")
+    all_rows.extend(crafty_rows)
 
     return all_rows
 
@@ -554,6 +633,7 @@ def merge_remote_sources(
                     "timestamp": normalized_ts,
                     "datetime": parse_timestamp(changed_at),
                     "source": source,
+                    "accurate": bool(row.get("accurate", True)),
                 }
             )
 
@@ -564,18 +644,26 @@ def merge_remote_sources(
     for entry in normalized_entries:
         by_name[entry["name"].lower()].append(entry)
 
-    # Step 3: For each name, if it has BOTH null and dated timestamps, remove the null
-    # (the null is likely incomplete data)
+    # Step 3: For each name with BOTH null and dated timestamps, decide what
+    # the null means. If the name's earliest dated entry is the earliest date
+    # in the whole history, the dated entry describes the same original-name
+    # event and the null is incomplete data — drop it. Otherwise another name
+    # predates it, so the null is the original name and the dated entry is a
+    # genuine reuse — keep both.
+    all_dated = [e["datetime"] for e in normalized_entries if e["datetime"]]
+    earliest_overall = min(all_dated) if all_dated else None
+
     cleaned_entries = []
     for name_lower, entries in by_name.items():
-        has_null = any(e["timestamp"] is None for e in entries)
-        has_dated = any(e["timestamp"] is not None for e in entries)
+        nulls = [e for e in entries if e["timestamp"] is None]
+        dated = [e for e in entries if e["timestamp"] is not None]
 
-        if has_null and has_dated:
+        if nulls and dated and min(e["datetime"] for e in dated) == earliest_overall:
             log.debug(
-                f"  Name '{entries[0]['name']}' has both null and dated timestamps - discarding null"
+                f"  Name '{entries[0]['name']}' has both null and dated timestamps "
+                "and is the oldest name - discarding null as incomplete"
             )
-            cleaned_entries.extend([e for e in entries if e["timestamp"] is not None])
+            cleaned_entries.extend(dated)
         else:
             cleaned_entries.extend(entries)
 
@@ -587,46 +675,72 @@ def merge_remote_sources(
         or datetime.min.replace(tzinfo=timezone.utc)
     )
 
-    # Step 5: Remove consecutive duplicates (same name appearing multiple times in a row)
-    merged = []
+    # Step 5: Collapse entries that describe the same change event. Sources
+    # report the same change with different clocks (seconds to weeks apart),
+    # so besides consecutive duplicates we also merge any same-name entries
+    # within FUZZY_WINDOW_DAYS of each other — Mojang's 30-day change cooldown
+    # means a genuine reuse can never fall inside that window. When merging,
+    # an accurate timestamp beats an approximated one; among equals the
+    # earlier wins (approximations always trail the real event).
+    fuzzy_window = timedelta(days=FUZZY_WINDOW_DAYS)
+    merged: List[Dict[str, Any]] = []
+
+    def same_event(existing: Dict[str, Any], entry: Dict[str, Any], consecutive: bool) -> bool:
+        if existing["name"].lower() != entry["name"].lower():
+            return False
+        if consecutive:
+            return True
+        prev_dt, curr_dt = existing["datetime"], entry["datetime"]
+        return (
+            prev_dt is not None
+            and curr_dt is not None
+            and curr_dt - prev_dt <= fuzzy_window
+        )
+
+    def better_estimate(candidate: Dict[str, Any], existing: Dict[str, Any]) -> bool:
+        if candidate["accurate"] != existing["accurate"]:
+            return candidate["accurate"]
+        cand_dt, exist_dt = candidate["datetime"], existing["datetime"]
+        return bool(cand_dt and exist_dt and cand_dt < exist_dt)
+
     for entry in cleaned_entries:
-        name = entry["name"]
-        timestamp = entry["timestamp"]
-        source = entry["source"]
+        match_idx = None
+        for i in range(len(merged) - 1, -1, -1):
+            if same_event(merged[i], entry, consecutive=(i == len(merged) - 1)):
+                match_idx = i
+                break
 
-        if merged:
-            last_name, last_timestamp = merged[-1]
-            if name.lower() == last_name.lower():
-                last_dt = parse_timestamp(last_timestamp)
-                curr_dt = parse_timestamp(timestamp)
+        if match_idx is not None:
+            existing = merged[match_idx]
+            if better_estimate(entry, existing):
+                log.debug(
+                    f"  Replacing {existing['name']} @ {existing['timestamp']} with "
+                    f"{entry['timestamp']} (from {entry['source']}, accurate={entry['accurate']})"
+                )
+                merged[match_idx] = entry
+            else:
+                log.debug(
+                    f"  Skipping duplicate event {entry['name']} @ {entry['timestamp']} (from {entry['source']})"
+                )
+            continue
 
-                if curr_dt and last_dt and curr_dt < last_dt:
-                    log.debug(
-                        f"  Replacing {last_name} @ {last_timestamp} with earlier {timestamp} (from {source})"
-                    )
-                    merged[-1] = (name, timestamp)
-                else:
-                    log.debug(
-                        f"  Skipping consecutive duplicate {name} @ {timestamp} (from {source})"
-                    )
-                continue
+        log.debug(f"  Adding {entry['name']} @ {entry['timestamp']} (from {entry['source']})")
+        merged.append(entry)
 
-        log.debug(f"  Adding {name} @ {timestamp} (from {source})")
-        merged.append((name, timestamp))
+    # Timestamps may have moved during merging; restore chronological order.
+    merged.sort(
+        key=lambda e: e["datetime"] or datetime.min.replace(tzinfo=timezone.utc)
+    )
+    result = [(e["name"], e["timestamp"]) for e in merged]
 
     # Step 6: Ensure current name is in the list
-    if merged:
-        last_name, _ = merged[-1]
-        if last_name.lower() != current_name.lower():
-            log.debug(f"  Adding current name '{current_name}' (not in history)")
-            merged.append((current_name, None))
-    else:
-        log.debug(f"  Adding current name '{current_name}' (empty history)")
-        merged.append((current_name, None))
+    if not result or result[-1][0].lower() != current_name.lower():
+        log.debug(f"  Adding current name '{current_name}'")
+        result.append((current_name, None))
 
-    log.info(f"Final merged result: {len(merged)} unique name changes")
+    log.info(f"Final merged result: {len(result)} unique name changes")
 
-    return merged
+    return result
 
 
 def gather_remote_skin_rows_by_uuid(
@@ -675,40 +789,75 @@ def get_current_skin_from_laby(uuid: str) -> Optional[Tuple[str, Optional[bool]]
 
 
 def merge_remote_skin_sources(
-    rows: List[Dict[str, Optional[str]]], current_skin_hash: str
+    rows: List[Dict[str, Optional[str]]],
+    current_skin_hash: str,
+    resolve_content_key: Optional[Callable[[str, Optional[str]], Optional[str]]] = None,
 ) -> List[Tuple[str, Optional[str], Optional[str], Optional[bool]]]:
+    """
+    `resolve_content_key` maps (skin_hash, file_hash) -> a stable identity for
+    the actual pixel content (e.g. a hash of the decoded texture), when it can
+    be resolved. Laby (MD5-style hash) and NameMC (opaque id) use incompatible
+    identifiers for the exact same texture, and their crawl timestamps for the
+    same real change can differ by weeks — far more than any fixed time
+    window — so without real content identity the same skin gets recorded
+    twice under two different "hashes". Falls back to the source-reported
+    hash string when the resolver is omitted or fails for a given entry.
+    """
+
+    def content_key(skin_hash: str, file_hash: Optional[str]) -> Tuple[str, bool]:
+        """Returns (key, verified) — verified means the key came from actual
+        pixel-content resolution, not a same-string fallback."""
+        if resolve_content_key:
+            resolved = resolve_content_key(skin_hash, file_hash)
+            if resolved:
+                return resolved, True
+        return skin_hash.lower(), False
+
     normalized_entries = []
     for row in rows:
         skin_hash = row.get("skin_hash")
         changed_at = row.get("changedAt")
         source = row.get("source", "unknown")
+        file_hash = row.get("file_hash")
 
         if skin_hash:
             normalized_ts = normalize_timestamp(changed_at)
+            key, verified = content_key(skin_hash, file_hash)
             normalized_entries.append(
                 {
                     "skin_hash": skin_hash,
-                    "file_hash": row.get("file_hash"),
+                    "file_hash": file_hash,
                     "slim": row.get("slim"),
                     "timestamp": normalized_ts,
                     "datetime": parse_timestamp(changed_at),
                     "source": source,
+                    "content_key": key,
+                    "content_verified": verified,
                 }
             )
 
     log.debug(f"Processing {len(normalized_entries)} skin entries from all sources")
 
-    by_hash = defaultdict(list)
+    # Same null-vs-dated resolution as name history: only drop a content
+    # key's null timestamp if its earliest dated occurrence is also the
+    # earliest dated occurrence overall — otherwise the null means this skin
+    # was worn again later without a source telling us when (a genuine
+    # reuse), not that the dated occurrence's timestamp is incomplete data
+    # for the same event.
+    by_key = defaultdict(list)
     for entry in normalized_entries:
-        by_hash[entry["skin_hash"].lower()].append(entry)
+        by_key[entry["content_key"]].append(entry)
+
+    all_dated = [e["datetime"] for e in normalized_entries if e["datetime"]]
+    earliest_overall = min(all_dated) if all_dated else None
 
     cleaned_entries = []
-    for entries in by_hash.values():
-        has_null = any(e["timestamp"] is None for e in entries)
-        has_dated = any(e["timestamp"] is not None for e in entries)
+    for entries in by_key.values():
+        nulls = [e for e in entries if e["timestamp"] is None]
+        dated = [e for e in entries if e["timestamp"] is not None]
 
-        if has_null and has_dated:
-            cleaned_entries.extend([e for e in entries if e["timestamp"] is not None])
+        if nulls and dated and min(e["datetime"] for e in dated) == earliest_overall:
+            cleaned_entries.extend(dated)
         else:
             cleaned_entries.extend(entries)
 
@@ -717,48 +866,94 @@ def merge_remote_skin_sources(
         or datetime.min.replace(tzinfo=timezone.utc)
     )
 
-    merged: List[Tuple[str, Optional[str], Optional[str], Optional[bool]]] = []
+    # Collapse entries describing the same skin-change event: within
+    # FUZZY_WINDOW_DAYS of each other is one signal, but cross-source crawl
+    # drift on the exact same content key can span weeks, so we also treat
+    # same-content-key entries as one event whenever no *different* content
+    # key's occurrence falls between them (you can't have "wear it, wear
+    # something else, wear it again" without that middle event showing up
+    # somewhere). Among matches the earliest timestamp wins.
+    fuzzy_window = timedelta(days=FUZZY_WINDOW_DAYS)
+
+    def has_intermediate(key: str, dt_a: datetime, dt_b: datetime) -> bool:
+        lo, hi = min(dt_a, dt_b), max(dt_a, dt_b)
+        return any(
+            e["content_key"] != key and e["datetime"] is not None and lo < e["datetime"] < hi
+            for e in cleaned_entries
+        )
+
+    merged: List[Dict[str, Any]] = []
+
+    def same_event(existing: Dict[str, Any], entry: Dict[str, Any], consecutive: bool) -> bool:
+        if existing["content_key"] != entry["content_key"]:
+            return False
+        # A verified pixel-content match is authoritative — Laby/NameMC crawl
+        # dates for the exact same texture can drift by weeks, so no time-gap
+        # or intermediate-activity heuristic should override proven identity.
+        if existing["content_verified"] and entry["content_verified"]:
+            return True
+        if consecutive:
+            return True
+        prev_dt, curr_dt = existing["datetime"], entry["datetime"]
+        if prev_dt is None or curr_dt is None:
+            return False
+        if abs(curr_dt - prev_dt) <= fuzzy_window:
+            return True
+        return not has_intermediate(entry["content_key"], prev_dt, curr_dt)
+
     for entry in cleaned_entries:
-        skin_hash = entry["skin_hash"]
-        timestamp = entry["timestamp"]
-        file_hash = entry["file_hash"]
-        slim = entry["slim"]
-        source = entry["source"]
+        match_idx = None
+        for i in range(len(merged) - 1, -1, -1):
+            if same_event(merged[i], entry, consecutive=(i == len(merged) - 1)):
+                match_idx = i
+                break
 
-        if merged:
-            last_hash, last_timestamp, _, _ = merged[-1]
-            if skin_hash.lower() == last_hash.lower():
-                last_dt = parse_timestamp(last_timestamp)
-                curr_dt = parse_timestamp(timestamp)
+        if match_idx is not None:
+            existing = merged[match_idx]
+            cand_dt, exist_dt = entry["datetime"], existing["datetime"]
+            if cand_dt and exist_dt and cand_dt < exist_dt:
+                log.debug(
+                    f"  Replacing skin {existing['skin_hash']} @ {existing['timestamp']} with "
+                    f"earlier {entry['timestamp']} (from {entry['source']})"
+                )
+                merged[match_idx] = entry
+            else:
+                log.debug(
+                    f"  Skipping duplicate skin event {entry['skin_hash']} @ {entry['timestamp']} (from {entry['source']})"
+                )
+            # Backfill file_hash/slim from whichever entry supplied them.
+            if not merged[match_idx]["file_hash"] and entry["file_hash"]:
+                merged[match_idx]["file_hash"] = entry["file_hash"]
+            if merged[match_idx]["slim"] is None and entry["slim"] is not None:
+                merged[match_idx]["slim"] = entry["slim"]
+            # Prefer a 32-char (Laby) hash for display/rendering.
+            if len(entry["skin_hash"]) == 32 and len(merged[match_idx]["skin_hash"]) != 32:
+                merged[match_idx]["skin_hash"] = entry["skin_hash"]
+            continue
 
-                if curr_dt and last_dt and curr_dt < last_dt:
-                    log.debug(
-                        f"  Replacing skin {last_hash} @ {last_timestamp} with earlier {timestamp} (from {source})"
-                    )
-                    merged[-1] = (skin_hash, timestamp, file_hash, slim)
-                else:
-                    log.debug(
-                        f"  Skipping consecutive duplicate skin {skin_hash} @ {timestamp} (from {source})"
-                    )
-                continue
+        log.debug(f"  Adding skin {entry['skin_hash']} @ {entry['timestamp']} (from {entry['source']})")
+        merged.append(dict(entry))
 
-        log.debug(f"  Adding skin {skin_hash} @ {timestamp} (from {source})")
-        merged.append((skin_hash, timestamp, file_hash, slim))
+    merged.sort(
+        key=lambda e: e["datetime"] or datetime.min.replace(tzinfo=timezone.utc)
+    )
+    result = [
+        (e["skin_hash"], e["timestamp"], e["file_hash"], e["slim"]) for e in merged
+    ]
 
-    if merged:
-        existing_hashes = {entry[0].lower() for entry in merged}
-        if current_skin_hash.lower() not in existing_hashes:
-            log.debug(
-                f"  Adding current skin '{current_skin_hash}' (not in history)"
-            )
-            merged.append((current_skin_hash, None, None, None))
+    if result:
+        current_key, _ = content_key(current_skin_hash, None)
+        existing_keys = {content_key(h, fh)[0] for h, _, fh, _ in result}
+        if current_key not in existing_keys:
+            log.debug(f"  Adding current skin '{current_skin_hash}' (not in history)")
+            result.append((current_skin_hash, None, None, None))
     else:
         log.debug(f"  Adding current skin '{current_skin_hash}' (empty history)")
-        merged.append((current_skin_hash, None, None, None))
+        result.append((current_skin_hash, None, None, None))
 
-    log.info(f"Final merged skin result: {len(merged)} unique skin changes")
+    log.info(f"Final merged skin result: {len(result)} unique skin changes")
 
-    return merged
+    return result
 
 
 # --- DATABASE ---
@@ -1027,11 +1222,13 @@ def query_history_public(session, uuid: str) -> Dict[str, Any]:
 
     rows = session.query(History).filter_by(uuid=uuid).all()
 
-    # Sort chronologically: None (original name) first, then by timestamp
+    # Sort chronologically: None (original name) first, then by parsed
+    # timestamp. Parsing (rather than string comparison) keeps rows stored
+    # in older formats (epoch millis, trailing "Z") in the right order.
     def sort_key(r):
-        if r.changed_at is None:
-            return ""  # Empty string sorts before ISO dates
-        return r.changed_at
+        return parse_timestamp(r.changed_at) or datetime.min.replace(
+            tzinfo=timezone.utc
+        )
 
     rows.sort(key=sort_key)
 
@@ -1081,31 +1278,72 @@ def _update_profile_from_sources(uuid: str, current_name: str) -> Dict[str, Any]
         ensure_profile(con, uuid, current_name)
         now = datetime.now(timezone.utc)
 
-        # Build a set of existing composite keys to avoid duplicates
-        existing = set(
-            (
-                r.name.lower(),
-                r.changed_at if r.changed_at is not None else None,
+        # Dedupe against existing rows fuzzily: the same change event can be
+        # stored with a slightly different timestamp (source clock drift,
+        # bad estimates, format changes across app versions), so exact string
+        # matching accumulates near-duplicate rows over time. Two same-name
+        # rows are the same event when their timestamps are close OR when no
+        # other name's change falls between them — you can't change a name to
+        # itself, so a genuine reuse always has an intermediate name.
+        fuzzy_window = timedelta(days=FUZZY_WINDOW_DAYS)
+        existing_rows = list(con.query(History).filter_by(uuid=uuid).all())
+
+        timeline = [
+            (r.name.lower(), parse_timestamp(r.changed_at)) for r in existing_rows
+        ] + [(n.lower(), parse_timestamp(c)) for n, c in pairs]
+
+        def has_intermediate_change(name: str, dt_a, dt_b) -> bool:
+            lo, hi = min(dt_a, dt_b), max(dt_a, dt_b)
+            return any(
+                other_name != name.lower() and other_dt is not None and lo < other_dt < hi
+                for other_name, other_dt in timeline
             )
-            for r in con.query(History).filter_by(uuid=uuid).all()
-        )
+
+        def find_same_event(name: str, new_dt):
+            for r in existing_rows:
+                if r.name.lower() != name.lower():
+                    continue
+                r_dt = parse_timestamp(r.changed_at)
+                if new_dt is None:
+                    # Incomplete/current-name marker: any same-name row
+                    # already covers it.
+                    return r
+                if r_dt is None:
+                    # Existing row is the original-name marker (no change
+                    # date exists for it); a dated entry is a separate
+                    # (reuse) event.
+                    continue
+                if abs(new_dt - r_dt) <= fuzzy_window:
+                    return r
+                if not has_intermediate_change(name, new_dt, r_dt):
+                    return r
+            return None
 
         inserted = 0
+        updated = 0
         for name, changed_at in pairs:
-            key = (name.lower(), changed_at if changed_at is not None else None)
-            if key in existing:
+            new_dt = parse_timestamp(changed_at)
+            match = find_same_event(name, new_dt)
+            if match is not None:
+                # Same event already recorded — converge on the earlier
+                # timestamp (approximations always trail the real event).
+                match_dt = parse_timestamp(match.changed_at)
+                if new_dt and match_dt and new_dt < match_dt:
+                    match.changed_at = changed_at
+                    updated += 1
                 continue
-            con.add(
-                History(
-                    uuid=uuid,
-                    name=name,
-                    changed_at=changed_at,
-                    observed_at=now,
-                )
+            row = History(
+                uuid=uuid,
+                name=name,
+                changed_at=changed_at,
+                observed_at=now,
             )
-            existing.add(key)
+            con.add(row)
+            existing_rows.append(row)
             inserted += 1
-        log.info(f"Inserted {inserted} new history rows (preserved existing).")
+        log.info(
+            f"Inserted {inserted} new history rows, refined {updated} timestamps (preserved existing)."
+        )
 
         update_source_timestamp(con, uuid, "scraper")
         con.flush()  # Ensure changes are visible to the query
@@ -1125,9 +1363,9 @@ def query_skin_history_public(session, uuid: str) -> Dict[str, Any]:
     rows = session.query(SkinHistory).filter_by(uuid=uuid).all()
 
     def sort_key(r):
-        if r.changed_at is None:
-            return ""
-        return r.changed_at
+        return parse_timestamp(r.changed_at) or datetime.min.replace(
+            tzinfo=timezone.utc
+        )
 
     rows.sort(key=sort_key)
 
@@ -1185,52 +1423,143 @@ def _update_skin_profile_from_sources(
             update_source_timestamp(con, uuid, "skin_scraper")
             return query_skin_history_public(con, uuid)
 
-    pairs = merge_remote_skin_sources(rows, current_skin_hash)
+    pairs = merge_remote_skin_sources(rows, current_skin_hash, resolve_skin_content_key)
     log.info(f"Merged into {len(pairs)} final skin history entries")
+
+    for skin_hash, _, file_hash, _ in pairs:
+        skin_store.prefetch(skin_hash, file_hash)
 
     with tx() as con:
         ensure_profile(con, uuid, current_name)
         now = datetime.now(timezone.utc)
 
-        existing = set(
-            (
-                r.skin_hash.lower(),
-                r.changed_at if r.changed_at is not None else None,
+        fuzzy_window = timedelta(days=FUZZY_WINDOW_DAYS)
+        existing_rows = list(con.query(SkinHistory).filter_by(uuid=uuid).all())
+
+        content_key_cache: Dict[Tuple[str, Optional[str]], Tuple[str, bool]] = {}
+
+        def row_content_key(skin_hash: str, file_hash: Optional[str]) -> str:
+            return row_content_key_verified(skin_hash, file_hash)[0]
+
+        def row_content_key_verified(skin_hash: str, file_hash: Optional[str]) -> Tuple[str, bool]:
+            cache_key = (skin_hash.lower(), (file_hash or "").lower())
+            if cache_key not in content_key_cache:
+                resolved = resolve_skin_content_key(skin_hash, file_hash)
+                content_key_cache[cache_key] = (
+                    (resolved, True) if resolved else (skin_hash.lower(), False)
+                )
+            return content_key_cache[cache_key]
+
+        # One-time retroactive cleanup: collapse any existing rows that are
+        # already duplicates under content-key identity (profiles refreshed
+        # before this fix could accumulate one row per source per skin, since
+        # Laby and NameMC use incompatible hash schemes for the same texture
+        # and their crawl timestamps for it can differ by weeks).
+        existing_by_key: Dict[str, List[Any]] = defaultdict(list)
+        for r in existing_rows:
+            existing_by_key[row_content_key(r.skin_hash, r.file_hash)].append(r)
+
+        deduped_existing: List[Any] = []
+        removed = 0
+        for key, group in existing_by_key.items():
+            if len(group) == 1:
+                deduped_existing.append(group[0])
+                continue
+            dated = [r for r in group if r.changed_at]
+            canonical = min(dated, key=lambda r: parse_timestamp(r.changed_at)) if dated else group[0]
+            for r in group:
+                if r is canonical:
+                    continue
+                if r.file_hash and not canonical.file_hash:
+                    canonical.file_hash = r.file_hash
+                if r.slim is not None and canonical.slim is None:
+                    canonical.slim = r.slim
+                log.info(
+                    f"  Removing duplicate skin row {r.skin_hash} @ {r.changed_at} "
+                    f"(same content as {canonical.skin_hash} @ {canonical.changed_at})"
+                )
+                con.delete(r)
+                removed += 1
+            deduped_existing.append(canonical)
+        existing_rows = deduped_existing
+        if removed:
+            log.info(f"Collapsed {removed} pre-existing duplicate skin rows for uuid={uuid}")
+            # Force the deletes to hit the DB now — otherwise SQLAlchemy can
+            # batch a later INSERT of a row sharing the same (uuid, skin_hash,
+            # changed_at) before the DELETE actually executes, violating the
+            # unique constraint even though the row is logically gone.
+            con.flush()
+
+        timeline = [
+            (row_content_key(r.skin_hash, r.file_hash), parse_timestamp(r.changed_at))
+            for r in existing_rows
+        ] + [(row_content_key(h, fh), parse_timestamp(c)) for h, c, fh, _ in pairs]
+
+        def has_intermediate_change(key: str, dt_a, dt_b) -> bool:
+            lo, hi = min(dt_a, dt_b), max(dt_a, dt_b)
+            return any(
+                other_key != key and other_dt is not None and lo < other_dt < hi
+                for other_key, other_dt in timeline
             )
-            for r in con.query(SkinHistory).filter_by(uuid=uuid).all()
-        )
+
+        def find_same_event(key: str, new_verified: bool, new_dt):
+            for r in existing_rows:
+                r_key, r_verified = row_content_key_verified(r.skin_hash, r.file_hash)
+                if r_key != key:
+                    continue
+                if new_verified and r_verified:
+                    # Proven pixel identity overrides any time-gap heuristic —
+                    # crawl dates for the same texture can drift by weeks.
+                    return r
+                r_dt = parse_timestamp(r.changed_at)
+                if new_dt is None:
+                    return r
+                if r_dt is None:
+                    continue
+                if abs(new_dt - r_dt) <= fuzzy_window:
+                    return r
+                if not has_intermediate_change(key, new_dt, r_dt):
+                    return r
+            return None
 
         inserted = 0
+        updated = 0
         for skin_hash, changed_at, file_hash, slim in pairs:
-            key = (
-                skin_hash.lower(),
-                changed_at if changed_at is not None else None,
-            )
-            if key in existing:
-                continue
             slim_value = None
             if slim is True:
                 slim_value = 1
             elif slim is False:
                 slim_value = 0
-            con.add(
-                SkinHistory(
-                    uuid=uuid,
-                    skin_hash=skin_hash,
-                    file_hash=file_hash,
-                    slim=slim_value,
-                    changed_at=changed_at,
-                    observed_at=now,
-                )
+
+            key, verified = row_content_key_verified(skin_hash, file_hash)
+            new_dt = parse_timestamp(changed_at)
+            match = find_same_event(key, verified, new_dt)
+            if match is not None:
+                match_dt = parse_timestamp(match.changed_at)
+                if new_dt and match_dt and new_dt < match_dt:
+                    match.changed_at = changed_at
+                    updated += 1
+                if file_hash and not match.file_hash:
+                    match.file_hash = file_hash
+                if slim_value is not None and match.slim is None:
+                    match.slim = slim_value
+                continue
+
+            row = SkinHistory(
+                uuid=uuid,
+                skin_hash=skin_hash,
+                file_hash=file_hash,
+                slim=slim_value,
+                changed_at=changed_at,
+                observed_at=now,
             )
-            existing.add(key)
+            con.add(row)
+            existing_rows.append(row)
             inserted += 1
         log.info(
-            f"Inserted {inserted} new skin history rows (preserved existing)."
+            f"Inserted {inserted} new skin history rows, refined {updated} timestamps, "
+            f"removed {removed} duplicates (preserved existing)."
         )
-
-        for skin_hash, _, file_hash, _ in pairs:
-            skin_store.prefetch(skin_hash, file_hash)
 
         update_source_timestamp(con, uuid, "skin_scraper")
         con.flush()
@@ -1240,6 +1569,7 @@ def _update_skin_profile_from_sources(
 app = Flask(__name__)
 
 register_skin_routes(app, skin_store)
+register_cape_routes(app, cape_store)
 
 
 @app.route("/api/namehistory", methods=["GET", "POST", "DELETE"])

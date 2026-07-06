@@ -3,10 +3,7 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, Optional
 
-try:
-    import tomli as toml
-except ImportError:
-    toml = None
+import tomllib
 
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -20,6 +17,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "default_sleep": 0.5,
         "bulk_min_delay": 0.8,
         "bulk_max_delay": 1.5,
+        "fuzzy_window_days": 1,
     },
     "database": {"type": "sqlite", "path": "namehistory.db"},
     "logging": {
@@ -141,10 +139,10 @@ def _config_path(filename: str) -> str:
 
 
 def _apply_toml_file(config: Dict[str, Any], path: str) -> Dict[str, Any]:
-    if not toml or not os.path.exists(path):
+    if not os.path.exists(path):
         return config
     with open(path, "rb") as handle:
-        data = toml.load(handle)
+        data = tomllib.load(handle)
     return _merge_dict(config, data)
 
 

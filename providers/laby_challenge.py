@@ -179,14 +179,22 @@ def exchange_turnstile_for_challenge(
     return str(token), expires_in, None
 
 
-def laby_v3_get(
-    uuid: str,
-    endpoint: str,
+def laby_v3_path_get(
+    path: str,
     scraper_session: Any,
     ctx: dict,
+    *,
+    invalidate_endpoint: Optional[str] = None,
 ) -> Tuple[Optional[dict], int, Optional[str]]:
+    """
+    GET an arbitrary `https://laby.net/api/v3/{path}` endpoint with the shared
+    LabyMod challenge token attached. `invalidate_endpoint` names which
+    logical endpoint this call represents for token-invalidation bookkeeping
+    (mirrors the `endpoint == "views"` special-casing below); pass None for
+    endpoints that should never drop the shared token on a 403.
+    """
     _sync_challenge_tokens(ctx)
-    url = f"https://laby.net/api/v3/user/{uuid}/{endpoint}"
+    url = f"https://laby.net/api/v3/{path}"
     headers = build_challenge_headers(ctx)
     header_name = str(ctx.get("laby_challenge_header") or "X-Challenge-Token")
     had_token = bool(headers.get(header_name))
@@ -202,15 +210,15 @@ def laby_v3_get(
     if response.status_code == 428:
         store = ctx.get("challenge_store")
         # Flag store when views needs a token, or when we had no token at all.
-        if store and (endpoint == "views" or not had_token):
+        if store and (invalidate_endpoint == "views" or not had_token):
             store.mark_needed("labymod")
         # Only drop the stored token when views rejects it — not when other v3
         # endpoints 428 while views already succeeded with the same token.
-        if had_token and endpoint == "views":
+        if had_token and invalidate_endpoint == "views":
             _invalidate_challenge(ctx)
         return None, 428, "Challenge token required — solve at /api/minecraft/captcha"
 
-    if response.status_code == 403 and had_token and endpoint == "views":
+    if response.status_code == 403 and had_token and invalidate_endpoint == "views":
         _invalidate_challenge(ctx)
         try:
             payload = response.json()
@@ -235,3 +243,18 @@ def laby_v3_get(
         return response.json(), 200, None
     except Exception:
         return None, response.status_code, "Invalid JSON from Laby API"
+
+
+def laby_v3_get(
+    uuid: str,
+    endpoint: str,
+    scraper_session: Any,
+    ctx: dict,
+) -> Tuple[Optional[dict], int, Optional[str]]:
+    """User-scoped v3 endpoint, e.g. views/heart/game-stats/online-status."""
+    return laby_v3_path_get(
+        f"user/{uuid}/{endpoint}",
+        scraper_session,
+        ctx,
+        invalidate_endpoint=endpoint,
+    )
