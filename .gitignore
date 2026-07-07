@@ -126,6 +126,7 @@ dmypy.json
 
 # pytype static type analyzer
 .pytype/
-
+!webui/src/lib/
+!webui/src/lib/**
 # Cython debug symbols
 cython_debug/
